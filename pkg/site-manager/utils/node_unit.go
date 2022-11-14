@@ -5,41 +5,41 @@ import (
 	"fmt"
 
 	"github.com/superedge/superedge/pkg/util"
+	utilkube "github.com/superedge/superedge/pkg/util/kubeclient"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	clientset "k8s.io/client-go/kubernetes"
+	corelisters "k8s.io/client-go/listers/core/v1"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 
-	sitev1 "github.com/superedge/superedge/pkg/site-manager/apis/site.superedge.io/v1alpha1"
+	sitev1 "github.com/superedge/superedge/pkg/site-manager/apis/site.superedge.io/v1alpha2"
+	"github.com/superedge/superedge/pkg/site-manager/constant"
 	crdClientset "github.com/superedge/superedge/pkg/site-manager/generated/clientset/versioned"
+	crdv1listers "github.com/superedge/superedge/pkg/site-manager/generated/listers/site.superedge.io/v1alpha2"
 )
 
-//  GetUnitsByNode
-func GetUnitsByNode(crdClient *crdClientset.Clientset, node *corev1.Node) (nodeUnits []sitev1.NodeUnit, err error) {
-	allNodeUnit, err := crdClient.SiteV1alpha1().NodeUnits().List(context.TODO(), metav1.ListOptions{})
-	if err != nil && !errors.IsConflict(err) {
-		klog.Errorf("List nodeUnit error: %#v", err)
-		return nil, err
-	}
+// GetUnitsByNode
+func GetUnitsByNode(unitLister crdv1listers.NodeUnitLister, node *corev1.Node) (nodeUnits []*sitev1.NodeUnit, unitList []string, err error) {
 
-	for _, nodeunit := range allNodeUnit.Items {
-		for _, nodeName := range nodeunit.Status.ReadyNodes {
-			if nodeName == node.Name {
-				nodeUnits = append(nodeUnits, nodeunit)
-			}
+	for k, v := range node.Labels {
+		if v == constant.NodeUnitSuperedge {
+			unitList = append(unitList, k)
 		}
-		for _, nodeName := range nodeunit.Status.NotReadyNodes {
-			if nodeName == node.Name {
-				nodeUnits = append(nodeUnits, nodeunit)
-			}
+	}
+	for _, nuName := range unitList {
+		nu, err := unitLister.Get(nuName)
+		if err != nil {
+			return nil, nil, err
 		}
+		nodeUnits = append(nodeUnits, nu)
 	}
 	return
 }
 
 /*
-  NodeUit Rate
+NodeUit Rate
 */
 func AddNodeUitReadyRate(nodeUnit *sitev1.NodeUnit) string {
 	unitStatus := nodeUnit.Status
@@ -115,6 +115,34 @@ func RemoveSetNode(kubeClient clientset.Interface, nodeUnit *sitev1.NodeUnit, no
 			klog.Errorf("Remove setNode update node: %s, error: %#v", node.Name, err)
 			continue
 		}
+	}
+	return nil
+}
+
+func CaculateNodeUnitStatus(nodeMap map[string]*corev1.Node, nu *sitev1.NodeUnit) (*sitev1.NodeUnitStatus, error) {
+	status := &sitev1.NodeUnitStatus{}
+	var readyList, nodeReadyList []string
+	for k, v := range nodeMap {
+		if utilkube.IsReadyNode(v) {
+			readyList = append(readyList, k)
+		} else {
+			nodeReadyList = append(nodeReadyList, k)
+		}
+	}
+	status.ReadyRate = fmt.Sprintf("%d/%d", len(readyList), len(readyList)+len(nodeReadyList))
+
+	// malc TODO: caculate unit cluster status
+	return status, nil
+}
+
+func ListNodeFromLister(nodeLister corelisters.NodeLister, selector labels.Selector, appendFn cache.AppendFunc) error {
+
+	nodes, err := nodeLister.List(selector)
+	if err != nil {
+		return err
+	}
+	for _, n := range nodes {
+		appendFn(n)
 	}
 	return nil
 }

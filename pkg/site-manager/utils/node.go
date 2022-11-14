@@ -3,7 +3,8 @@ package utils
 import (
 	"context"
 	"encoding/json"
-	sitev1 "github.com/superedge/superedge/pkg/site-manager/apis/site.superedge.io/v1alpha1"
+
+	sitev1 "github.com/superedge/superedge/pkg/site-manager/apis/site.superedge.io/v1alpha2"
 	"github.com/superedge/superedge/pkg/site-manager/constant"
 	"github.com/superedge/superedge/pkg/util"
 	utilkube "github.com/superedge/superedge/pkg/util/kubeclient"
@@ -11,7 +12,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
-	"strings"
 )
 
 func GetNodesByUnit(kubeclient clientset.Interface, nodeUnit *sitev1.NodeUnit) (readyNodes, notReadyNodes []string, err error) {
@@ -199,22 +199,22 @@ func SetNodeRole(kubeClient clientset.Interface, node *corev1.Node) error {
 	return nil
 }
 
-func SetNodeToNodes(kubeClient clientset.Interface, setNode sitev1.SetNode, nodeNames []string) {
-	klog.V(4).Infof("SetNode to node is: %s", util.ToJson(setNode))
-	for _, nodeName := range nodeNames {
-		node, err := kubeClient.CoreV1().Nodes().Get(context.TODO(), nodeName, metav1.GetOptions{})
-		if err != nil {
-			klog.Errorf("SetNode to node get node: %s error: %v", node.Name, err)
+func SetNodeToNodes(kubeClient clientset.Interface, nu *sitev1.NodeUnit, nodeMaps map[string]*corev1.Node) error {
+	klog.V(4).Infof("SetNode to node is: %s", util.ToJson(nu.Spec.SetNode))
+	for _, node := range nodeMaps {
+		if v, ok := node.Labels[nu.Name]; ok && v == constant.NodeUnitSuperedge {
+			// node has been set skip
 			continue
 		}
-
+		// deep copy for don't update informer cache
+		node := node.DeepCopy()
 		// set labels
-		if setNode.Labels != nil {
+		if nu.Spec.SetNode.Labels != nil {
 			if node.Labels == nil {
 				node.Labels = make(map[string]string)
-				node.Labels = setNode.Labels
+				node.Labels = nu.Spec.SetNode.Labels
 			} else {
-				for key, val := range setNode.Labels {
+				for key, val := range nu.Spec.SetNode.Labels {
 					node.Labels[key] = val
 				}
 			}
@@ -222,64 +222,59 @@ func SetNodeToNodes(kubeClient clientset.Interface, setNode sitev1.SetNode, node
 		klog.V(4).Infof("SetNode to node labels: %s", util.ToJson(node.Labels))
 
 		// setNode annotations
-		if setNode.Annotations != nil {
+		if nu.Spec.SetNode.Annotations != nil {
 			if node.Annotations == nil {
 				node.Annotations = make(map[string]string)
-				node.Annotations = setNode.Annotations
+				node.Annotations = nu.Spec.SetNode.Annotations
 			} else {
-				for key, val := range setNode.Annotations {
+				for key, val := range nu.Spec.SetNode.Annotations {
 					node.Annotations[key] = val
 				}
 			}
 		}
 
 		// setNode taints
-		if setNode.Taints != nil {
+		if nu.Spec.SetNode.Taints != nil {
 			if node.Spec.Taints == nil {
 				node.Spec.Taints = []corev1.Taint{}
 			}
-			node.Spec.Taints = append(node.Spec.Taints, setNode.Taints...)
+			node.Spec.Taints = append(node.Spec.Taints, nu.Spec.SetNode.Taints...)
 		}
 
 		if _, err := kubeClient.CoreV1().Nodes().Update(context.TODO(), node, metav1.UpdateOptions{}); err != nil {
 			klog.Errorf("SetNode to node update Node: %s, error: %#v", node.Name, err)
-			continue
+			return err
 		}
 	}
+	return nil
 }
 
-func DeleteNodesFromSetNode(kubeClient clientset.Interface, setNode sitev1.SetNode, nodeNames []string) {
-	for _, nodeName := range nodeNames {
-		node, err := kubeClient.CoreV1().Nodes().Get(context.TODO(), nodeName, metav1.GetOptions{})
-		if err != nil {
-			if strings.Contains(err.Error(), "not found") {
-				klog.Warningf("Get node: %s nil", node.Name)
-				continue
-			}
-		}
-
-		if setNode.Labels != nil {
-			if node.Labels != nil {
-				for k, _ := range setNode.Labels {
-					delete(node.Labels, k)
+func DeleteNodesFromSetNode(kubeClient clientset.Interface, nu *sitev1.NodeUnit, nodeMaps map[string]*corev1.Node) error {
+	for _, node := range nodeMaps {
+		newNode := node.DeepCopy()
+		if nu.Spec.SetNode.Labels != nil {
+			if newNode.Labels != nil {
+				for k, _ := range nu.Spec.SetNode.Labels {
+					delete(newNode.Labels, k)
 				}
 			}
 		}
 
-		if setNode.Annotations != nil {
-			if node.Annotations != nil {
-				for k, _ := range setNode.Annotations {
-					delete(node.Annotations, k)
+		if nu.Spec.SetNode.Annotations != nil {
+			if newNode.Annotations != nil {
+				for k, _ := range nu.Spec.SetNode.Annotations {
+					delete(newNode.Annotations, k)
 				}
 			}
 		}
-		node.Spec.Taints = deleteTaintItems(node.Spec.Taints, setNode.Taints)
+		newNode.Spec.Taints = deleteTaintItems(newNode.Spec.Taints, nu.Spec.SetNode.Taints)
 
-		if _, err := kubeClient.CoreV1().Nodes().Update(context.TODO(), node, metav1.UpdateOptions{}); err != nil {
+		if _, err := kubeClient.CoreV1().Nodes().Update(context.TODO(), newNode, metav1.UpdateOptions{}); err != nil {
 			klog.Errorf("Update Node: %s, error: %#v", node.Name, err)
-			continue
+			return err
 		}
 	}
+	return nil
 }
 
 func SetUpdatedValue(oldValues map[string]string, curValues map[string]string, modifyValues *map[string]string) {

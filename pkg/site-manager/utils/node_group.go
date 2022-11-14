@@ -21,7 +21,11 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"fmt"
+	"sort"
+	"strings"
+
 	"github.com/superedge/superedge/pkg/site-manager/apis/site.superedge.io/v1alpha1"
+	"github.com/superedge/superedge/pkg/site-manager/apis/site.superedge.io/v1alpha2"
 	siteClientset "github.com/superedge/superedge/pkg/site-manager/generated/clientset/versioned"
 	sitecrdClientset "github.com/superedge/superedge/pkg/site-manager/generated/clientset/versioned"
 	"github.com/superedge/superedge/pkg/util"
@@ -30,11 +34,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
-	"sort"
-	"strings"
 )
 
-func AutoFindNodeKeysbyNodeGroup(kubeclient clientset.Interface, crdClient *sitecrdClientset.Clientset, nodeGroup *v1alpha1.NodeGroup) {
+func AutoFindNodeKeysbyNodeGroup(kubeclient clientset.Interface, crdClient *sitecrdClientset.Clientset, nodeGroup *v1alpha2.NodeGroup) {
 	// find nodes by keys
 	allnodes, err := kubeclient.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
@@ -83,7 +85,7 @@ func withCheckSize(name string) bool {
 	return false
 }
 
-func newNodeUnit(crdClient *sitecrdClientset.Clientset, nodeGroup *v1alpha1.NodeGroup, name string, sel map[string]string) error {
+func newNodeUnit(crdClient *sitecrdClientset.Clientset, nodeGroup *v1alpha2.NodeGroup, name string, sel map[string]string) error {
 	newname := filterString(name)
 
 	klog.V(4).Infof("prepare to ceate nodeUnite: %s, selector: %s", newname, sel)
@@ -188,7 +190,7 @@ func checkifcontains(nodelabel map[string]string, keyslices []string) (bool, str
 	return true, res, sel
 }
 
-func GetUnitsByNodeGroup(kubeClient clientset.Interface, siteClient *siteClientset.Clientset, nodeGroup *v1alpha1.NodeGroup) (nodeUnits []string, err error) {
+func GetUnitsByNodeGroup(kubeClient clientset.Interface, siteClient *siteClientset.Clientset, nodeGroup *v1alpha2.NodeGroup) (nodeUnits []string, err error) {
 	// Get units by selector
 	var unitList *v1alpha1.NodeUnitList
 	selector := nodeGroup.Spec.Selector
@@ -224,7 +226,7 @@ func GetUnitsByNodeGroup(kubeClient clientset.Interface, siteClient *siteClients
 	// Get units by nodeName
 	unitsNames := nodeGroup.Spec.NodeUnits
 	for _, unitName := range unitsNames {
-		unit, err := siteClient.SiteV1alpha1().NodeUnits().Get(context.TODO(), unitName, metav1.GetOptions{})
+		unit, err := siteClient.SiteV1alpha2().NodeUnits().Get(context.TODO(), unitName, metav1.GetOptions{})
 		if err != nil {
 			klog.Errorf("Get unit by nodeGroup, error: %v", err)
 			continue
@@ -272,8 +274,8 @@ func GetNodeGroupsByUnit(siteClient *siteClientset.Clientset, unitName string) (
 	return nodeGroups, nil
 }
 
-func UnitMatchNodeGroups(kubeClient clientset.Interface, siteClient *siteClientset.Clientset, unitName string) (nodeGroups []v1alpha1.NodeGroup, err error) {
-	allNodeGroups, err := siteClient.SiteV1alpha1().NodeGroups().List(context.TODO(), metav1.ListOptions{})
+func UnitMatchNodeGroups(kubeClient clientset.Interface, siteClient *siteClientset.Clientset, unitName string) (nodeGroups []v1alpha2.NodeGroup, err error) {
+	allNodeGroups, err := siteClient.SiteV1alpha2().NodeGroups().List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
 		klog.Errorf("Get nodeGroup by unit, error: %v", err)
 		return nil, err
