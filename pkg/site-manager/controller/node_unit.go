@@ -126,6 +126,7 @@ func NewSitesManagerDaemonController(
 	nodeUnitController.nodeUnitLister = nodeUnitInformer.Lister()
 	nodeUnitController.nodeUnitListerSynced = nodeUnitInformer.Informer().HasSynced
 
+	nodeUnitController.nodeUnitDeleter = deleter.NewNodeUnitDeleter(kubeClient, crdClient, nodeInformer.Lister(), NodeUnitFinalizerID)
 	klog.V(4).Infof("Site-manager set handler success")
 
 	return nodeUnitController
@@ -163,8 +164,8 @@ func (c *NodeUnitController) processNextWorkItem() bool {
 	}
 	defer c.queue.Done(key)
 	klog.V(4).Infof("Get siteManager queue key: %s", key)
-
-	c.handleErr(nil, key)
+	err := c.syncHandler(key.(string))
+	c.handleErr(err, key)
 
 	return true
 }
@@ -359,17 +360,10 @@ func (c *NodeUnitController) syncUnit(key string) error {
 	}
 
 	// reconcile
-
-	return nil
+	return c.reconcileNodeUnit(nu)
 }
 func (c *NodeUnitController) enqueue(name string) {
-	key, err := KeyFunc(name)
-	if err != nil {
-		utilruntime.HandleError(fmt.Errorf("Couldn't get key for object %#v: %v", name, err))
-		return
-	}
-
-	c.queue.Add(key)
+	c.queue.Add(name)
 }
 
 // func (c *NodeUnitController) addNodeUnit(obj interface{}) {
@@ -408,11 +402,11 @@ func (c *NodeUnitController) enqueue(name string) {
 // 	/*
 // 	 nodeGroup action
 // 	*/
-// 	nodeGroups, err := utils.UnitMatchNodeGroups(c.kubeClient, c.crdClient, nodeUnit.Name)
-// 	if err != nil {
-// 		klog.Errorf("Get NodeGroups error: %v", err)
-// 		return
-// 	}
+// nodeGroups, err := utils.UnitMatchNodeGroups(c.kubeClient, c.crdClient, nodeUnit.Name)
+// if err != nil {
+// 	klog.Errorf("Get NodeGroups error: %v", err)
+// 	return
+// }
 
 // 	// Update nodegroups
 // 	for _, nodeGroup := range nodeGroups {
@@ -582,60 +576,8 @@ func (c *NodeUnitController) reconcileNodeUnit(nu *sitev1alpha2.NodeUnit) error 
 	// malc TODO: set node role? why?
 
 	// 0. list nodemap and nodeset belong to current node unit
-	unitNodeSet := sets.NewString()
-	var nodeMap map[string]*corev1.Node
-	appendFunc := func(n interface{}) {
-		node, ok := n.(*corev1.Node)
-		if !ok {
-			return
-		}
-		nodeMap[node.Name] = node
-		unitNodeSet.Insert(node.Name)
-	}
-	if len(nu.Spec.Nodes) > 0 {
-		nodeSelector := labels.NewSelector()
-		nRequire, err := labels.NewRequirement(
-			corev1.LabelHostname,
-			selection.In,
-			nu.Spec.Nodes,
-		)
-		if err != nil {
-			return err
-		}
-		nodeSelector.Add(*nRequire)
-		utils.ListNodeFromLister(c.nodeLister, nodeSelector, appendFunc)
-	}
-	if nu.Spec.Selector != nil && nu.Spec.Selector.MatchLabels != nil {
-		nodeSelector := labels.NewSelector()
-		for k, v := range nu.Spec.Selector.MatchLabels {
-			nRequire, err := labels.NewRequirement(
-				k,
-				selection.In,
-				[]string{v},
-			)
-			if err != nil {
-				return err
-			}
-			nodeSelector.Add(*nRequire)
-		}
-		utils.ListNodeFromLister(c.nodeLister, nodeSelector, appendFunc)
-	}
-	if nu.Spec.Selector != nil && nu.Spec.Selector.MatchExpressions != nil {
-		nodeSelector := labels.NewSelector()
-		for _, m := range nu.Spec.Selector.MatchExpressions {
-			nRequire, err := labels.NewRequirement(
-				m.Key,
-				selection.Operator(m.Operator),
-				m.Values,
-			)
-			if err != nil {
-				return err
-			}
-			nodeSelector.Add(*nRequire)
-		}
-		utils.ListNodeFromLister(c.nodeLister, nodeSelector, appendFunc)
-	}
 
+	unitNodeSet, nodeMap, err := utils.GetNodesByUnit(c.nodeLister, nu)
 	// 1. check nodes which should not belong to this unit, clear them(this will use gc)
 	currentNodeSet := sets.NewString()
 
@@ -674,22 +616,21 @@ func (c *NodeUnitController) reconcileNodeUnit(nu *sitev1alpha2.NodeUnit) error 
 		return err
 	}
 	// 3. caculate node unit status
-	newNu := nu.DeepCopy()
 	newStatus, err := utils.CaculateNodeUnitStatus(nodeMap, nu)
 	if err != nil {
 		return nil
 	}
-	newNu.Status = *newStatus
+	nu.Status = *newStatus
 
-	if !reflect.DeepEqual(newNu.Status, nu.Status) {
+	if !reflect.DeepEqual(*newStatus, nu.Status) {
 		// update node unit status only when status changed
-		_, err = c.crdClient.SiteV1alpha2().NodeUnits().UpdateStatus(context.TODO(), newNu, metav1.UpdateOptions{})
+		_, err = c.crdClient.SiteV1alpha2().NodeUnits().UpdateStatus(context.TODO(), nu, metav1.UpdateOptions{})
 		if err != nil {
-			klog.Errorf("Update nodeUnit: %s error: %#v", newNu.Name, err)
+			klog.Errorf("Update nodeUnit: %s error: %#v", nu.Name, err)
 			return err
 		}
 	}
-	klog.V(5).Infof("NodeUnit=(%s) update success", newNu.Name)
+	klog.V(5).Infof("NodeUnit=(%s) update success", nu.Name)
 
 	return nil
 }

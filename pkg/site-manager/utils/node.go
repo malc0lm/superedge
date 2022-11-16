@@ -2,60 +2,185 @@ package utils
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
+	"sort"
 
+	"github.com/superedge/superedge/pkg/site-manager/apis/site.superedge.io/v1alpha2"
 	sitev1 "github.com/superedge/superedge/pkg/site-manager/apis/site.superedge.io/v1alpha2"
 	"github.com/superedge/superedge/pkg/site-manager/constant"
+	crdClientset "github.com/superedge/superedge/pkg/site-manager/generated/clientset/versioned"
+	crdv1listers "github.com/superedge/superedge/pkg/site-manager/generated/listers/site.superedge.io/v1alpha2"
 	"github.com/superedge/superedge/pkg/util"
 	utilkube "github.com/superedge/superedge/pkg/util/kubeclient"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/selection"
+	"k8s.io/apimachinery/pkg/util/sets"
 	clientset "k8s.io/client-go/kubernetes"
+	corelisters "k8s.io/client-go/listers/core/v1"
+
 	"k8s.io/klog/v2"
 )
 
-func GetNodesByUnit(kubeclient clientset.Interface, nodeUnit *sitev1.NodeUnit) (readyNodes, notReadyNodes []string, err error) {
-	selector := nodeUnit.Spec.Selector
-	var nodes []corev1.Node
+// GetUnitsByNode
+func GetGroupsByUnit(groupLister crdv1listers.NodeGroupLister, nu *sitev1.NodeUnit) (nodeGroups []*sitev1.NodeGroup, groupList []string, err error) {
 
-	// Get Nodes by selector
-	if selector != nil {
-		if len(selector.MatchLabels) > 0 || len(selector.MatchExpressions) > 0 {
-			labelSelector := &metav1.LabelSelector{
-				MatchLabels:      selector.MatchLabels,
-				MatchExpressions: selector.MatchExpressions,
-			}
-			selector, err := metav1.LabelSelectorAsSelector(labelSelector)
-			if err != nil {
-				return readyNodes, notReadyNodes, err
-			}
-			listOptions := metav1.ListOptions{LabelSelector: selector.String()}
-			nodeList, err := kubeclient.CoreV1().Nodes().List(context.TODO(), listOptions)
-			if err != nil {
-				klog.Errorf("Get nodes by selector, error: %v", err)
-				return readyNodes, notReadyNodes, err
-			}
-			nodes = append(nodes, nodeList.Items...)
-		}
-
-		if len(selector.Annotations) > 0 { //todo: add Annotations selector
-
+	for k, v := range nu.Labels {
+		if v == constant.NodeGroupSuperedge {
+			groupList = append(groupList, k)
 		}
 	}
-
-	// Get Nodes by nodeName
-	nodeNames := nodeUnit.Spec.Nodes
-	for _, nodeName := range nodeNames {
-		node, err := kubeclient.CoreV1().Nodes().Get(context.TODO(), nodeName, metav1.GetOptions{})
+	for _, ngName := range groupList {
+		ng, err := groupLister.Get(ngName)
 		if err != nil {
-			klog.Errorf("Get node: %s, error: %s", nodeUnit.Name, err)
+			return nil, nil, err
+		}
+		nodeGroups = append(nodeGroups, ng)
+	}
+	return
+}
+
+// GetUnitsByNode
+func GetUnitsByNode(unitLister crdv1listers.NodeUnitLister, node *corev1.Node) (nodeUnits []*sitev1.NodeUnit, unitList []string, err error) {
+
+	for k, v := range node.Labels {
+		if v == constant.NodeUnitSuperedge {
+			unitList = append(unitList, k)
+		}
+	}
+	for _, nuName := range unitList {
+		nu, err := unitLister.Get(nuName)
+		if err != nil {
+			return nil, nil, err
+		}
+		nodeUnits = append(nodeUnits, nu)
+	}
+	return
+}
+
+func SetNodeToNodeUnits(crdClient *crdClientset.Clientset, ng *v1alpha2.NodeGroup, unitMaps map[string]*v1alpha2.NodeUnit) error {
+	klog.V(4).InfoS("SetNode to node unit: %s", "nodegroup", ng.Name)
+
+	for _, nu := range unitMaps {
+		if v, ok := nu.Labels[ng.Name]; ok && v == constant.NodeGroupSuperedge {
 			continue
 		}
-		nodes = append(nodes, *node)
+		newNu := nu.DeepCopy()
+		// update setnode for add label({nodegroup name}: {nodeunit name}) for node
+		setNode := newNu.Spec.SetNode
+		if setNode.Labels == nil {
+			setNode.Labels = make(map[string]string)
+		}
+		setNode.Labels[ng.Name] = newNu.Name
+
+		if newNu.Labels == nil {
+			newNu.Labels = make(map[string]string)
+		}
+		// set node group as owner
+		newNu.Labels[ng.Name] = constant.NodeGroupSuperedge
+
+		if _, err := crdClient.SiteV1alpha2().NodeUnits().Update(context.TODO(), newNu, metav1.UpdateOptions{}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func GetUnitByGroup(unitLister crdv1listers.NodeUnitLister, ng *sitev1.NodeGroup) (sets.String, map[string]*sitev1.NodeUnit, error) {
+	groupUnitSet := sets.NewString()
+	var unitMap map[string]*sitev1.NodeUnit
+	appendFunc := func(n interface{}) {
+		nu, ok := n.(*sitev1.NodeUnit)
+		if !ok {
+			return
+		}
+		unitMap[nu.Name] = nu
+		groupUnitSet.Insert(nu.Name)
+	}
+	if len(ng.Spec.NodeUnits) > 0 {
+		for _, nuName := range ng.Spec.NodeUnits {
+			nu, err := unitLister.Get(nuName)
+			if err != nil && errors.IsNotFound(err) {
+				klog.V(4).InfoS("Nodegroup units not found", "node group", ng.Name, "node unit", nuName)
+				continue
+			} else if err != nil {
+				return nil, nil, err
+			}
+			unitMap[nu.Name] = nu
+			groupUnitSet.Insert(nu.Name)
+		}
+	}
+	if ng.Spec.Selector != nil {
+		labelSelector := &metav1.LabelSelector{
+			MatchLabels:      ng.Spec.Selector.MatchLabels,
+			MatchExpressions: ng.Spec.Selector.MatchExpressions,
+		}
+		unitSelector, err := metav1.LabelSelectorAsSelector(labelSelector)
+		if err != nil {
+			return nil, nil, err
+		}
+		ListNodeUnitFromLister(unitLister, unitSelector, appendFunc)
+	}
+	if len(ng.Spec.AutoFindNodeKeys) > 0 {
+		labelSelector := &metav1.LabelSelector{
+			MatchLabels: map[string]string{
+				constant.NodeUnitAutoFindLabel: HashAutoFindKeys(ng.Spec.AutoFindNodeKeys),
+				ng.Name:                        constant.NodeGroupSuperedge,
+			},
+		}
+		unitSelector, err := metav1.LabelSelectorAsSelector(labelSelector)
+		if err != nil {
+			return nil, nil, err
+		}
+		ListNodeUnitFromLister(unitLister, unitSelector, appendFunc)
 	}
 
-	readyNodes, notReadyNodes = utilkube.GetNodeListStatus(nodes) // get all readynode and notReadyNodes
-	return util.RemoveDuplicateElement(readyNodes), util.RemoveDuplicateElement(notReadyNodes), nil
+	return groupUnitSet, unitMap, nil
+
+}
+
+func GetNodesByUnit(nodeLister corelisters.NodeLister, nu *sitev1.NodeUnit) (sets.String, map[string]*corev1.Node, error) {
+
+	unitNodeSet := sets.NewString()
+	var nodeMap map[string]*corev1.Node
+	appendFunc := func(n interface{}) {
+		node, ok := n.(*corev1.Node)
+		if !ok {
+			return
+		}
+		nodeMap[node.Name] = node
+		unitNodeSet.Insert(node.Name)
+	}
+	if len(nu.Spec.Nodes) > 0 {
+		nodeSelector := labels.NewSelector()
+		nRequire, err := labels.NewRequirement(
+			corev1.LabelHostname,
+			selection.In,
+			nu.Spec.Nodes,
+		)
+		if err != nil {
+			return nil, nil, err
+		}
+		nodeSelector.Add(*nRequire)
+		ListNodeFromLister(nodeLister, nodeSelector, appendFunc)
+	}
+
+	if nu.Spec.Selector != nil {
+		labelSelector := &metav1.LabelSelector{
+			MatchLabels:      nu.Spec.Selector.MatchLabels,
+			MatchExpressions: nu.Spec.Selector.MatchExpressions,
+		}
+		nodeSelector, err := metav1.LabelSelectorAsSelector(labelSelector)
+		if err != nil {
+			return nil, nil, err
+		}
+		ListNodeFromLister(nodeLister, nodeSelector, appendFunc)
+	}
+	return unitNodeSet, nodeMap, nil
 }
 
 /*
@@ -277,6 +402,29 @@ func DeleteNodesFromSetNode(kubeClient clientset.Interface, nu *sitev1.NodeUnit,
 	return nil
 }
 
+func DeleteNodeUnitFromSetNode(crdClient *crdClientset.Clientset, ng *sitev1.NodeGroup, unitMaps map[string]*sitev1.NodeUnit) error {
+	for _, nu := range unitMaps {
+		newNu := nu.DeepCopy()
+
+		// delete node group owner label
+		if newNu.Labels != nil {
+			delete(newNu.Labels, ng.Name)
+		}
+
+		// delete setNode which will trigger node unit controller clean node label
+		if newNu.Spec.SetNode.Labels != nil {
+			delete(newNu.Spec.SetNode.Labels, ng.Name)
+		}
+
+		_, err := crdClient.SiteV1alpha2().NodeUnits().Update(context.TODO(), newNu, metav1.UpdateOptions{})
+		if err != nil {
+			return err
+		}
+
+	}
+	return nil
+}
+
 func SetUpdatedValue(oldValues map[string]string, curValues map[string]string, modifyValues *map[string]string) {
 	// delete old values
 	for k, _ := range oldValues {
@@ -388,4 +536,17 @@ func NeedUpdateNode(nodeNamesOld, nodeNamesCur []string) (removeNodes []string, 
 		}
 	}
 	return
+}
+
+func HashAutoFindKeys(keyslices []string) string {
+	if len(keyslices) == 0 {
+		return ""
+	}
+	sort.Strings(keyslices)
+
+	h := sha1.New()
+	for _, key := range keyslices {
+		h.Write([]byte(key))
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }

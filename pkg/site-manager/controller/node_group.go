@@ -18,13 +18,19 @@ package controller
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"fmt"
+	"reflect"
+	"sort"
 	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 	appinformers "k8s.io/client-go/informers/apps/v1"
 	coreinformers "k8s.io/client-go/informers/core/v1"
@@ -39,16 +45,15 @@ import (
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
-	"github.com/pingcap/errors"
 	sitev1alpha2 "github.com/superedge/superedge/pkg/site-manager/apis/site.superedge.io/v1alpha2"
 	deleter "github.com/superedge/superedge/pkg/site-manager/controller/deleter"
+	"k8s.io/apimachinery/pkg/api/errors"
 
 	"github.com/superedge/superedge/pkg/site-manager/constant"
 	crdClientset "github.com/superedge/superedge/pkg/site-manager/generated/clientset/versioned"
 	crdinformers "github.com/superedge/superedge/pkg/site-manager/generated/informers/externalversions/site.superedge.io/v1alpha2"
 	crdv1listers "github.com/superedge/superedge/pkg/site-manager/generated/listers/site.superedge.io/v1alpha2"
 	"github.com/superedge/superedge/pkg/site-manager/utils"
-	"github.com/superedge/superedge/pkg/util"
 )
 
 type NodeGroupController struct {
@@ -70,7 +75,7 @@ type NodeGroupController struct {
 	crdClient     *crdClientset.Clientset
 
 	syncHandler      func(key string) error
-	enqueueNodeGroup func(nu *sitev1alpha2.NodeGroup)
+	enqueueNodeGroup func(name string)
 	nodeGroupDeleter *deleter.NodeGroupDeleter
 }
 
@@ -96,18 +101,6 @@ func NewNodeGroupController(
 		queue:         workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "site-manager-daemon"),
 	}
 
-	nodeInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    groupController.addNode,
-		UpdateFunc: groupController.updateNode,
-		DeleteFunc: groupController.deleteNode,
-	})
-
-	dsInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    groupController.addDaemonSet,
-		UpdateFunc: groupController.updateDaemonSet,
-		DeleteFunc: groupController.deleteDaemonSet,
-	})
-
 	nodeUnitInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    groupController.addNodeUnit,
 		UpdateFunc: groupController.updateNodeUnit,
@@ -120,20 +113,20 @@ func NewNodeGroupController(
 		DeleteFunc: groupController.deleteNodeGroup,
 	})
 
-	groupController.syncHandler = groupController.syncUnit
+	groupController.syncHandler = groupController.syncGroup
 	groupController.enqueueNodeGroup = groupController.enqueue
 
 	groupController.nodeLister = nodeInformer.Lister()
 	groupController.nodeListerSynced = nodeInformer.Informer().HasSynced
 
+	// malc0lm TODO: add node informer to auto find node key immediately
 	groupController.nodeUnitLister = nodeUnitInformer.Lister()
 	groupController.nodeUnitListerSynced = nodeUnitInformer.Informer().HasSynced
 
 	groupController.nodeGroupLister = nodeGroupInformer.Lister()
 	groupController.nodeGroupListerSynced = nodeGroupInformer.Informer().HasSynced
 
-	klog.V(4).Infof("Site-manager set handler success")
-
+	groupController.nodeGroupDeleter = deleter.NewNodeGroupDeleter(kubeClient, crdClient, nodeUnitInformer.Lister(), NodeGroupFinalizerID)
 	return groupController
 }
 
@@ -169,8 +162,8 @@ func (c *NodeGroupController) processNextWorkItem() bool {
 	}
 	defer c.queue.Done(key)
 	klog.V(4).Infof("Get siteManager queue key: %s", key)
-
-	c.handleErr(nil, key)
+	err := c.syncHandler(key.(string))
+	c.handleErr(err, key)
 
 	return true
 }
@@ -182,157 +175,158 @@ func (c *NodeGroupController) handleErr(err error, key interface{}) {
 	}
 
 	if c.queue.NumRequeues(key) < constant.MaxRetries {
-		klog.V(2).Infof("Error syncing siteManager %v: %v", key, err)
+		klog.V(2).Infof("Error syncing NodeGroup %v: %v", key, err)
 		c.queue.AddRateLimited(key)
 		return
 	}
 
 	utilruntime.HandleError(err)
-	klog.V(2).Infof("Dropping siteManager %q out of the queue: %v", key, err)
+	klog.V(2).Infof("Dropping NodeGroup %q out of the queue: %v", key, err)
 	c.queue.Forget(key)
 }
 
-func (siteManager *NodeGroupController) addNodeGroup(obj interface{}) {
-	nodeGroup := obj.(*sitev1alpha2.NodeGroup)
-	klog.V(4).Infof("Get Add nodeGroup: %s", util.ToJson(nodeGroup))
-	if nodeGroup.DeletionTimestamp != nil {
-		siteManager.deleteNodeGroup(nodeGroup) //todo
-		return
-	}
+// func (siteManager *NodeGroupController) addNodeGroup1(obj interface{}) {
+// 	nodeGroup := obj.(*sitev1alpha2.NodeGroup)
+// 	klog.V(4).Infof("Get Add nodeGroup: %s", util.ToJson(nodeGroup))
+// 	if nodeGroup.DeletionTimestamp != nil {
+// 		siteManager.deleteNodeGroup(nodeGroup) //todo
+// 		return
+// 	}
 
-	if len(nodeGroup.Finalizers) == 0 {
-		nodeGroup.Finalizers = append(nodeGroup.Finalizers, NodeGroupFinalizerID)
-	}
+// 	if len(nodeGroup.Finalizers) == 0 {
+// 		nodeGroup.Finalizers = append(nodeGroup.Finalizers, NodeGroupFinalizerID)
+// 	}
 
-	if len(nodeGroup.Spec.AutoFindNodeKeys) > 0 {
-		utils.AutoFindNodeKeysbyNodeGroup(siteManager.kubeClient, siteManager.crdClient, nodeGroup)
-	}
+// 	// 处理自动发现逻辑
+// 	if len(nodeGroup.Spec.AutoFindNodeKeys) > 0 {
+// 		utils.AutoFindNodeKeysbyNodeGroup(siteManager.kubeClient, siteManager.crdClient, nodeGroup)
+// 	}
+// 	// 这里添加了 给unit加setnode的逻辑，恶心
+// 	units, err := utils.GetUnitsByNodeGroup(siteManager.kubeClient, siteManager.crdClient, nodeGroup)
+// 	if err != nil {
+// 		if strings.Contains(err.Error(), "not found") {
+// 			units = []string{}
+// 			klog.Warningf("Get NodeGroup: %s unit nil", nodeGroup.Name)
+// 		} else {
+// 			klog.Errorf("Get NodeGroup unit error: %v", err)
+// 			return
+// 		}
+// 	}
+// 	// 更新状态
+// 	nodeGroup.Status.NodeUnits = units
+// 	nodeGroup.Status.UnitNumber = len(units)
+// 	_, err = siteManager.crdClient.SiteV1alpha2().NodeGroups().UpdateStatus(context.TODO(), nodeGroup, metav1.UpdateOptions{})
+// 	if err != nil {
+// 		klog.Errorf("Update nodeGroup: %s error: %#v", nodeGroup.Name, err)
+// 		return
+// 	}
 
-	units, err := utils.GetUnitsByNodeGroup(siteManager.kubeClient, siteManager.crdClient, nodeGroup)
-	if err != nil {
-		if strings.Contains(err.Error(), "not found") {
-			units = []string{}
-			klog.Warningf("Get NodeGroup: %s unit nil", nodeGroup.Name)
-		} else {
-			klog.Errorf("Get NodeGroup unit error: %v", err)
-			return
-		}
-	}
+// 	klog.V(4).Infof("Add nodeGroup: %s success.", nodeGroup.Name)
+// }
 
-	nodeGroup.Status.NodeUnits = units
-	nodeGroup.Status.UnitNumber = len(units)
-	_, err = siteManager.crdClient.SiteV1alpha2().NodeGroups().UpdateStatus(context.TODO(), nodeGroup, metav1.UpdateOptions{})
-	if err != nil {
-		klog.Errorf("Update nodeGroup: %s error: %#v", nodeGroup.Name, err)
-		return
-	}
+// func (siteManager *NodeGroupController) updateNodeGroup1(oldObj, newObj interface{}) {
+// 	oldNodeGroup := oldObj.(*sitev1alpha2.NodeGroup)
+// 	curNodeGroup := newObj.(*sitev1alpha2.NodeGroup)
+// 	klog.V(4).Infof("Get oldNodeGroup: %s", util.ToJson(oldNodeGroup))
+// 	klog.V(4).Infof("Get curNodeGroup: %s", util.ToJson(curNodeGroup))
 
-	klog.V(4).Infof("Add nodeGroup: %s success.", nodeGroup.Name)
-}
+// 	if len(curNodeGroup.Finalizers) == 0 {
+// 		curNodeGroup.Finalizers = append(curNodeGroup.Finalizers, NodeGroupFinalizerID)
+// 	}
 
-func (siteManager *NodeGroupController) updateNodeGroup(oldObj, newObj interface{}) {
-	oldNodeGroup := oldObj.(*sitev1alpha2.NodeGroup)
-	curNodeGroup := newObj.(*sitev1alpha2.NodeGroup)
-	klog.V(4).Infof("Get oldNodeGroup: %s", util.ToJson(oldNodeGroup))
-	klog.V(4).Infof("Get curNodeGroup: %s", util.ToJson(curNodeGroup))
+// 	if curNodeGroup.DeletionTimestamp != nil {
+// 		siteManager.deleteNodeGroup(curNodeGroup) //todo
+// 		return
+// 	}
 
-	if len(curNodeGroup.Finalizers) == 0 {
-		curNodeGroup.Finalizers = append(curNodeGroup.Finalizers, NodeGroupFinalizerID)
-	}
+// 	if oldNodeGroup.ResourceVersion == curNodeGroup.ResourceVersion {
+// 		return
+// 	}
 
-	if curNodeGroup.DeletionTimestamp != nil {
-		siteManager.deleteNodeGroup(curNodeGroup) //todo
-		return
-	}
+// 	if len(curNodeGroup.Spec.AutoFindNodeKeys) > 0 {
+// 		utils.AutoFindNodeKeysbyNodeGroup(siteManager.kubeClient, siteManager.crdClient, curNodeGroup)
+// 	}
+// 	/*
+// 		curNodeGroup
+// 	*/
 
-	if oldNodeGroup.ResourceVersion == curNodeGroup.ResourceVersion {
-		return
-	}
+// 	units, err := utils.GetUnitsByNodeGroup(siteManager.kubeClient, siteManager.crdClient, curNodeGroup)
+// 	if err != nil {
+// 		klog.Errorf("Get NodeGroup unit error: %v", err)
+// 		return
+// 	}
+// 	klog.V(4).Infof("NodeGroup: %s select nodeUnits: %v", curNodeGroup.Name, units)
 
-	if len(curNodeGroup.Spec.AutoFindNodeKeys) > 0 {
-		utils.AutoFindNodeKeysbyNodeGroup(siteManager.kubeClient, siteManager.crdClient, curNodeGroup)
-	}
-	/*
-		curNodeGroup
-	*/
+// 	curNodeGroup.Status.NodeUnits = units
+// 	curNodeGroup.Status.UnitNumber = len(units)
+// 	curNodeGroup, err = siteManager.crdClient.SiteV1alpha2().NodeGroups().UpdateStatus(context.TODO(), curNodeGroup, metav1.UpdateOptions{})
+// 	if err != nil {
+// 		klog.Errorf("Update nodeGroup: %s error: %#v", curNodeGroup.Name, err)
+// 		return
+// 	}
 
-	units, err := utils.GetUnitsByNodeGroup(siteManager.kubeClient, siteManager.crdClient, curNodeGroup)
-	if err != nil {
-		klog.Errorf("Get NodeGroup unit error: %v", err)
-		return
-	}
-	klog.V(4).Infof("NodeGroup: %s select nodeUnits: %v", curNodeGroup.Name, units)
+// 	// reomve old nodegroup label
+// 	var removeUnit []string
+// 	unitMap := make(map[string]bool)
+// 	for _, unit := range units {
+// 		unitMap[unit] = true
+// 	}
+// 	for _, unit := range oldNodeGroup.Status.NodeUnits {
+// 		if !unitMap[unit] {
+// 			removeUnit = append(removeUnit, unit) //todo: more to do
+// 		}
+// 	}
+// 	utils.RemoveUnitSetNode(siteManager.crdClient, removeUnit, []string{curNodeGroup.Name})
 
-	curNodeGroup.Status.NodeUnits = units
-	curNodeGroup.Status.UnitNumber = len(units)
-	curNodeGroup, err = siteManager.crdClient.SiteV1alpha2().NodeGroups().UpdateStatus(context.TODO(), curNodeGroup, metav1.UpdateOptions{})
-	if err != nil {
-		klog.Errorf("Update nodeGroup: %s error: %#v", curNodeGroup.Name, err)
-		return
-	}
+// 	klog.V(4).Infof("Updated nodeGroup: %s success", util.ToJson(curNodeGroup))
+// }
 
-	// reomve old nodegroup label
-	var removeUnit []string
-	unitMap := make(map[string]bool)
-	for _, unit := range units {
-		unitMap[unit] = true
-	}
-	for _, unit := range oldNodeGroup.Status.NodeUnits {
-		if !unitMap[unit] {
-			removeUnit = append(removeUnit, unit) //todo: more to do
-		}
-	}
-	utils.RemoveUnitSetNode(siteManager.crdClient, removeUnit, []string{curNodeGroup.Name})
+// func (siteManager *NodeGroupController) deleteNodeGroup1(obj interface{}) {
+// 	nodeGroup, ok := obj.(*sitev1alpha2.NodeGroup)
+// 	if !ok {
+// 		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+// 		if !ok {
+// 			utilruntime.HandleError(fmt.Errorf("Couldn't get object from tombstone %#v\n", obj))
+// 			return
+// 		}
+// 		nodeGroup, ok = tombstone.Obj.(*sitev1alpha2.NodeGroup)
+// 		if !ok {
+// 			utilruntime.HandleError(fmt.Errorf("Tombstone contained object is not a nodeGroup %#v\n", obj))
+// 			return
+// 		}
+// 	}
+// 	// finalizer里处理
+// 	// check all nodes, if which have the label with nodegroup name then remove
+// 	for _, nu := range nodeGroup.Status.NodeUnits {
+// 		nodeUnit, err := siteManager.crdClient.SiteV1alpha1().NodeUnits().Get(context.TODO(), nu, metav1.GetOptions{})
+// 		if err != nil {
+// 			klog.Errorf("List nodeUnit error: %#v", err)
+// 			continue
+// 		}
+// 		if nodeUnit.Spec.SetNode.Labels != nil {
+// 			delete(nodeUnit.Spec.SetNode.Labels, nodeGroup.Name)
+// 		}
 
-	klog.V(4).Infof("Updated nodeGroup: %s success", util.ToJson(curNodeGroup))
-}
+// 		_, err = siteManager.crdClient.SiteV1alpha1().NodeUnits().Update(context.TODO(), nodeUnit, metav1.UpdateOptions{})
+// 		if err != nil {
+// 			klog.Error("Update nodeunit fail ", err)
+// 		}
+// 	}
 
-func (siteManager *NodeGroupController) deleteNodeGroup(obj interface{}) {
-	nodeGroup, ok := obj.(*sitev1alpha2.NodeGroup)
-	if !ok {
-		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
-		if !ok {
-			utilruntime.HandleError(fmt.Errorf("Couldn't get object from tombstone %#v\n", obj))
-			return
-		}
-		nodeGroup, ok = tombstone.Obj.(*sitev1alpha2.NodeGroup)
-		if !ok {
-			utilruntime.HandleError(fmt.Errorf("Tombstone contained object is not a nodeGroup %#v\n", obj))
-			return
-		}
-	}
+// 	klog.V(4).Infof("Delete NodeGroup: %s succes.", nodeGroup.Name)
+// 	return
+// }
 
-	// check all nodes, if which have the label with nodegroup name then remove
-	for _, nu := range nodeGroup.Status.NodeUnits {
-		nodeUnit, err := siteManager.crdClient.SiteV1alpha1().NodeUnits().Get(context.TODO(), nu, metav1.GetOptions{})
-		if err != nil {
-			klog.Errorf("List nodeUnit error: %#v", err)
-			continue
-		}
-		if nodeUnit.Spec.SetNode.Labels != nil {
-			delete(nodeUnit.Spec.SetNode.Labels, nodeGroup.Name)
-		}
-
-		_, err = siteManager.crdClient.SiteV1alpha1().NodeUnits().Update(context.TODO(), nodeUnit, metav1.UpdateOptions{})
-		if err != nil {
-			klog.Error("Update nodeunit fail ", err)
-		}
-	}
-
-	klog.V(4).Infof("Delete NodeGroup: %s succes.", nodeGroup.Name)
-	return
-}
-
-func (c *NodeGroupController) syncUnit(key string) error {
+func (c *NodeGroupController) syncGroup(key string) error {
 	startTime := time.Now()
-	klog.V(4).InfoS("Started syncing nodeunit", "nodeunit", key, "startTime", startTime)
+	klog.V(4).InfoS("Started syncing nodegroup", "nodegroup", key, "startTime", startTime)
 	defer func() {
-		klog.V(4).InfoS("Finished syncing nodeunit", "nodeunit", key, "duration", time.Since(startTime))
+		klog.V(4).InfoS("Finished syncing nodegroup", "nodegroup", key, "duration", time.Since(startTime))
 	}()
 
 	n, err := c.nodeGroupLister.Get(key)
 	if errors.IsNotFound(err) {
-		klog.V(2).InfoS("NodeUnit has been deleted", "nodeunit", key)
+		klog.V(2).InfoS("NodeGroup has been deleted", "nodegroup", key)
 		// deal with node unit delete
 
 		return nil
@@ -375,35 +369,323 @@ func (c *NodeGroupController) syncUnit(key string) error {
 
 	// reconcile
 
-	return nil
+	return c.reconcileNodeGroup(ng)
 }
-func (c *NodeGroupController) enqueue(nu *sitev1alpha2.NodeGroup) {
-	key, err := KeyFunc(nu)
+func (c *NodeGroupController) enqueue(name string) {
+	c.queue.Add(name)
+}
+
+func (c *NodeGroupController) reconcileNodeGroup(ng *sitev1alpha2.NodeGroup) error {
+	unitSet, unitMap, err := utils.GetUnitByGroup(c.nodeUnitLister, ng)
 	if err != nil {
-		utilruntime.HandleError(fmt.Errorf("Couldn't get key for object %#v: %v", nu, err))
-		return
+		klog.ErrorS(err, "GetUnitByGroup error")
+		return err
 	}
 
-	c.queue.Add(key)
-}
+	// 1. ensure  node unit which not belong to this group
+	currentUnitSet := sets.NewString()
 
-func (c *NodeGroupController) addDaemonSet(obj interface{}) {
-}
-func (c *NodeGroupController) updateDaemonSet(oldObj interface{}, newObj interface{}) {
-}
-func (c *NodeGroupController) deleteDaemonSet(obj interface{}) {
-}
+	var currentUnitMap, gcUnitMap map[string]*sitev1alpha2.NodeUnit
+	unitLabelSelector := &metav1.LabelSelector{
+		MatchLabels: map[string]string{ng.Name: constant.NodeGroupSuperedge},
+	}
+	unitSelector, err := metav1.LabelSelectorAsSelector(unitLabelSelector)
+	if err != nil {
+		return err
+	}
+	utils.ListNodeUnitFromLister(c.nodeUnitLister, unitSelector, func(n interface{}) {
+		nu, ok := n.(*sitev1alpha2.NodeUnit)
+		if !ok {
+			return
+		}
+		currentUnitMap[nu.Name] = nu
+		currentUnitSet.Insert(nu.Name)
+	})
+	needGCUnits := currentUnitSet.Difference(unitSet)
+	for _, gcNode := range needGCUnits.UnsortedList() {
+		gcUnitMap[gcNode] = currentUnitMap[gcNode]
+	}
+	if err := utils.DeleteNodeUnitFromSetNode(c.crdClient, ng, gcUnitMap); err != nil {
+		klog.ErrorS(err, "DeleteNodeUnitFromSetNode error")
+		return err
+	}
 
-func (c *NodeGroupController) addNode(obj interface{}) {
-}
-func (c *NodeGroupController) updateNode(oldObj interface{}, newObj interface{}) {
-}
-func (c *NodeGroupController) deleteNode(obj interface{}) {
+	// 2. ensure autoFindKey node will work fine
+	if len(ng.Spec.AutoFindNodeKeys) > 0 {
+		if err := c.autoFindNodeKeysByNodeGroup(ng); err != nil {
+			klog.ErrorS(err, "autoFindNodeKeysByNodeGroup error")
+			return err
+		}
+	}
+
+	// 3. ensure node group child node unit has property label
+	if err := utils.SetNodeToNodeUnits(c.crdClient, ng, unitMap); err != nil {
+		klog.ErrorS(err, "SetNodeToNodeUnits error")
+		return err
+	}
+	// 4. caculate status and update group status
+	newStatus, err := utils.CaculateNodeGroupStatus(unitSet, ng)
+	if err != nil {
+		return err
+	}
+	ng.Status = *newStatus
+
+	if !reflect.DeepEqual(*newStatus, ng.Status) {
+		// update node unit status only when status changed
+		_, err = c.crdClient.SiteV1alpha2().NodeGroups().UpdateStatus(context.TODO(), ng, metav1.UpdateOptions{})
+		if err != nil {
+			klog.Errorf("Update NodeGroup=(%s) error: %#v", ng.Name, err)
+			return err
+		}
+	}
+	klog.V(5).Infof("NodeGroup=(%s) update success", ng.Name)
+	return nil
 }
 
 func (c *NodeGroupController) addNodeUnit(obj interface{}) {
+	nu := obj.(*sitev1alpha2.NodeUnit)
+	if nu.DeletionTimestamp != nil {
+		c.deleteNodeUnit(obj)
+		return
+	}
+	klog.V(5).InfoS("Adding NodeUnit", "nodeunit", klog.KObj(nu))
+
+	_, groupList, err := utils.GetGroupsByUnit(c.nodeGroupLister, nu)
+	if err != nil {
+		klog.V(2).ErrorS(err, "GetGroupsByUnit error", "nodeunit", klog.KObj(nu))
+		return
+	}
+	for _, ng := range groupList {
+		c.enqueueNodeGroup(ng)
+	}
+
 }
 func (c *NodeGroupController) updateNodeUnit(oldObj interface{}, newObj interface{}) {
+	oldNu, newNu := oldObj.(*sitev1alpha2.NodeUnit), newObj.(*sitev1alpha2.NodeUnit)
+	if oldNu.ResourceVersion == newNu.ResourceVersion {
+		// Periodic resync will send update events for all known nodes.
+		return
+	}
+	klog.V(5).InfoS("Updating NodeUnit", "old node unit", klog.KObj(oldNu), "new node unit", klog.KObj(newNu))
+
+	var oldGroupLabel, newGroupLabel map[string]string
+	for k, v := range oldNu.Labels {
+		if v == constant.NodeGroupSuperedge {
+			oldGroupLabel[k] = v
+		}
+	}
+	for k, v := range newNu.Labels {
+		if v == constant.NodeGroupSuperedge {
+			newGroupLabel[k] = v
+		}
+	}
+	// maybe update node group label manual, recover it
+	if !reflect.DeepEqual(oldGroupLabel, newGroupLabel) {
+		_, groupList, err := utils.GetGroupsByUnit(c.nodeGroupLister, oldNu)
+		if err != nil {
+			klog.V(2).ErrorS(err, "GetGroupsByUnit error", "node unit", oldNu.Name)
+			return
+		}
+		for _, ngName := range groupList {
+			c.enqueueNodeGroup(ngName)
+		}
+	}
+	// current unit enqueqe
+	_, groupList, err := utils.GetGroupsByUnit(c.nodeGroupLister, newNu)
+	if err != nil {
+		klog.V(2).ErrorS(err, "GetGroupsByUnit error", "node unit", newNu.Name)
+		return
+	}
+	for _, ngName := range groupList {
+		c.enqueueNodeGroup(ngName)
+	}
+	return
+
 }
 func (c *NodeGroupController) deleteNodeUnit(obj interface{}) {
+	nu, ok := obj.(*sitev1alpha2.NodeUnit)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			utilruntime.HandleError(fmt.Errorf("couldn't get object from tombstone %#v", obj))
+			return
+		}
+		nu, ok = tombstone.Obj.(*sitev1alpha2.NodeUnit)
+		if !ok {
+			utilruntime.HandleError(fmt.Errorf("tombstone contained object that is not a NodeUnit %#v", obj))
+			return
+		}
+	}
+	klog.V(5).InfoS("Deleting NodeUnit", "node unit", klog.KObj(nu))
+
+	_, groupList, err := utils.GetGroupsByUnit(c.nodeGroupLister, nu)
+	if err != nil {
+		klog.V(2).ErrorS(err, "GetGroupsByUnit error", "node unit", nu.Name)
+		return
+	}
+	for _, ngName := range groupList {
+		c.enqueueNodeGroup(ngName)
+	}
+}
+
+func (c *NodeGroupController) addNodeGroup(obj interface{}) {
+	ng := obj.(*sitev1alpha2.NodeGroup)
+	klog.V(5).InfoS("Adding NodeGroup", "node group", klog.KObj(ng))
+	c.enqueueNodeGroup(ng.Name)
+}
+
+func (c *NodeGroupController) updateNodeGroup(oldObj interface{}, newObj interface{}) {
+	oldNg, newNg := oldObj.(*sitev1alpha2.NodeGroup), newObj.(*sitev1alpha2.NodeGroup)
+	klog.V(5).InfoS("Updating NodeGroup", "old node group", klog.KObj(oldNg), "new node group", klog.KObj(newNg))
+	c.enqueueNodeGroup(newNg.Name)
+}
+
+func (c *NodeGroupController) deleteNodeGroup(obj interface{}) {
+	ng, ok := obj.(*sitev1alpha2.NodeGroup)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			utilruntime.HandleError(fmt.Errorf("couldn't get object from tombstone %#v", obj))
+			return
+		}
+		ng, ok = tombstone.Obj.(*sitev1alpha2.NodeGroup)
+		if !ok {
+			utilruntime.HandleError(fmt.Errorf("tombstone contained object that is not a NodeGroup %#v", obj))
+			return
+		}
+	}
+	klog.V(5).InfoS("Deleting NodeGroup", "node group", klog.KObj(ng))
+	c.enqueueNodeGroup(ng.Name)
+}
+
+func (c *NodeGroupController) autoFindNodeKeysByNodeGroup(nodeGroup *sitev1alpha2.NodeGroup) error {
+	// find nodes by keys
+	allnodes, err := c.nodeLister.List(labels.Everything())
+	if err != nil {
+		return err
+	}
+	var matchNodes []*corev1.Node
+
+	for _, node := range allnodes {
+		if len(node.Labels) == 0 {
+			continue
+		}
+		match, newUnitName, newUnitSelector := checkIfContains(node.Labels, nodeGroup.Spec.AutoFindNodeKeys)
+		if match && len(newUnitSelector) > 0 {
+			matchNodes = append(matchNodes, node)
+			// auto find key match, create a net node unit
+			c.newNodeUnit(nodeGroup, newUnitName, nodeGroup.Spec.AutoFindNodeKeys, newUnitSelector)
+		}
+	}
+	return nil
+}
+
+func filterString(name string) string {
+	if withCheckContains(name) || withCheckSize(name) {
+		return hashString(name)
+	}
+	return name
+}
+
+func hashString(name string) string {
+	h := sha1.New()
+	h.Write([]byte(name))
+	sha1_hash := hex.EncodeToString(h.Sum(nil))
+	return sha1_hash
+}
+
+func withCheckContains(name string) bool {
+	if strings.Contains(name, "/") {
+		return true
+	}
+	return false
+}
+
+// check size is it more than 64
+func withCheckSize(name string) bool {
+	if len(name) >= 64 {
+		return true
+	}
+	return false
+}
+
+func (c *NodeGroupController) newNodeUnit(ng *sitev1alpha2.NodeGroup, newname string, keyslices []string, sel map[string]string) error {
+
+	klog.V(4).Infof("prepare to ceate nodeUnite: %s, selector: %s", newname, sel)
+	var nuLabel = make(map[string]string)
+	nuLabel[constant.NodeUnitAutoFindLabel] = utils.HashAutoFindKeys(keyslices)
+	nuLabel[ng.Name] = constant.NodeGroupSuperedge
+
+	newNodeUnit := &sitev1alpha2.NodeUnit{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        newname,
+			Annotations: sel,
+			Labels:      nuLabel,
+		},
+		Spec: sitev1alpha2.NodeUnitSpec{
+			Type: utils.EdgeNodeUnit,
+			Selector: &sitev1alpha2.Selector{
+				MatchLabels: sel,
+			},
+			SetNode: sitev1alpha2.SetNode{
+				Labels: map[string]string{ng.Name: newname, newname: constant.NodeUnitSuperedge},
+			},
+		},
+	}
+
+	// check if any exist generated node unit and update it
+	currentNu, err := c.crdClient.SiteV1alpha2().NodeUnits().Get(context.TODO(), newname, metav1.GetOptions{})
+	if errors.IsNotFound(err) {
+		klog.Warning("obj not found, will create nodeunit now")
+		_, err = c.crdClient.SiteV1alpha2().NodeUnits().Create(context.TODO(), newNodeUnit, metav1.CreateOptions{})
+		if err != nil {
+			klog.ErrorS(err, "error to create node unit")
+			return err
+		}
+
+	} else if err == nil {
+		if !reflect.DeepEqual(currentNu.Spec.Selector.MatchLabels, sel) || !reflect.DeepEqual(currentNu.Labels, nuLabel) {
+			currentNu.Spec.Selector.MatchLabels = sel
+			currentNu.Labels = nuLabel
+			_, err := c.crdClient.SiteV1alpha2().NodeUnits().Update(context.TODO(), currentNu, metav1.UpdateOptions{})
+			if err != nil {
+				return err
+			}
+		}
+	} else {
+		return err
+	}
+
+	return nil
+}
+
+func checkOwnerReferenceContains(owner metav1.OwnerReference, tmpSlice []metav1.OwnerReference) bool {
+	for _, value := range tmpSlice {
+		if value == owner {
+			return true
+		}
+	}
+	return false
+}
+
+func checkIfContains(nodelabel map[string]string, keyslices []string) (bool, string, map[string]string) {
+	var res string
+	var sel = make(map[string]string)
+	sort.Strings(keyslices)
+	for _, value := range keyslices {
+		if _, ok := nodelabel[value]; ok {
+			sel[value] = nodelabel[value]
+			if res == "" {
+				res = nodelabel[value]
+			} else {
+				res = res + "-" + nodelabel[value]
+			}
+
+			continue
+		} else {
+			return false, "", sel
+		}
+	}
+	// check new unit name is vaild for Name field
+	return true, filterString(res), sel
 }
