@@ -66,16 +66,25 @@ func SetNodeToNodeUnits(crdClient *crdClientset.Clientset, ng *v1alpha2.NodeGrou
 	klog.V(4).InfoS("SetNode to node unit: %s", "nodegroup", ng.Name)
 
 	for _, nu := range unitMaps {
-		if v, ok := nu.Labels[ng.Name]; ok && v == constant.NodeGroupSuperedge {
+		setNodeReady, ownerLabelReady := true, true
+		if nu.Spec.SetNode.Labels != nil && nu.Spec.SetNode.Labels[ng.Name] != nu.Name {
+			setNodeReady = false
+		}
+
+		if nu.Labels != nil && nu.Labels[ng.Name] != constant.NodeGroupSuperedge {
+			ownerLabelReady = false
+		}
+
+		if setNodeReady && ownerLabelReady {
 			continue
 		}
 		newNu := nu.DeepCopy()
 		// update setnode for add label({nodegroup name}: {nodeunit name}) for node
-		setNode := newNu.Spec.SetNode
-		if setNode.Labels == nil {
-			setNode.Labels = make(map[string]string)
+
+		if newNu.Spec.SetNode.Labels == nil {
+			newNu.Spec.SetNode.Labels = make(map[string]string)
 		}
-		setNode.Labels[ng.Name] = newNu.Name
+		newNu.Spec.SetNode.Labels[ng.Name] = newNu.Name
 
 		if newNu.Labels == nil {
 			newNu.Labels = make(map[string]string)
@@ -92,7 +101,7 @@ func SetNodeToNodeUnits(crdClient *crdClientset.Clientset, ng *v1alpha2.NodeGrou
 
 func GetUnitByGroup(unitLister crdv1listers.NodeUnitLister, ng *sitev1.NodeGroup) (sets.String, map[string]*sitev1.NodeUnit, error) {
 	groupUnitSet := sets.NewString()
-	var unitMap map[string]*sitev1.NodeUnit
+	unitMap := make(map[string]*sitev1.NodeUnit, 3)
 	appendFunc := func(n interface{}) {
 		nu, ok := n.(*sitev1.NodeUnit)
 		if !ok {
@@ -146,7 +155,7 @@ func GetUnitByGroup(unitLister crdv1listers.NodeUnitLister, ng *sitev1.NodeGroup
 func GetNodesByUnit(nodeLister corelisters.NodeLister, nu *sitev1.NodeUnit) (sets.String, map[string]*corev1.Node, error) {
 
 	unitNodeSet := sets.NewString()
-	var nodeMap map[string]*corev1.Node
+	nodeMap := make(map[string]*corev1.Node, 5)
 	appendFunc := func(n interface{}) {
 		node, ok := n.(*corev1.Node)
 		if !ok {
@@ -325,10 +334,41 @@ func SetNodeRole(kubeClient clientset.Interface, node *corev1.Node) error {
 }
 
 func SetNodeToNodes(kubeClient clientset.Interface, nu *sitev1.NodeUnit, nodeMaps map[string]*corev1.Node) error {
-	klog.V(4).Infof("SetNode to node is: %s", util.ToJson(nu.Spec.SetNode))
+	klog.V(4).InfoS("SetNodeToNodes SetNode", "nu.Spec.SetNode", util.ToJson(nu.Spec.SetNode))
 	for _, node := range nodeMaps {
-		if v, ok := node.Labels[nu.Name]; ok && v == constant.NodeUnitSuperedge {
-			// node has been set skip
+		// first check if need update node
+		labelSet, annoSet, taintSet := true, true, true
+		if nu.Spec.SetNode.Labels != nil {
+			for k, v := range nu.Spec.SetNode.Labels {
+				if node.Labels == nil || node.Labels[k] != v {
+					labelSet = false
+					break
+				}
+			}
+		}
+		if nu.Spec.SetNode.Annotations != nil {
+			for k, v := range nu.Spec.SetNode.Annotations {
+				if node.Annotations == nil || node.Labels[k] != v {
+					annoSet = false
+					break
+				}
+			}
+		}
+
+		if nu.Spec.SetNode.Taints != nil {
+			// if node.Spec.Taints ==nil || reflect.DeepEqual()
+			if node.Spec.Taints == nil {
+				taintSet = false
+			} else {
+				for _, setTaint := range nu.Spec.SetNode.Taints {
+					if !TaintInSlices(node.Spec.Taints, setTaint) {
+						taintSet = false
+						break
+					}
+				}
+			}
+		}
+		if labelSet && annoSet && taintSet {
 			continue
 		}
 		// deep copy for don't update informer cache
@@ -344,7 +384,7 @@ func SetNodeToNodes(kubeClient clientset.Interface, nu *sitev1.NodeUnit, nodeMap
 				}
 			}
 		}
-		klog.V(4).Infof("SetNode to node labels: %s", util.ToJson(node.Labels))
+		klog.V(4).InfoS("SetNodeToNodes node labels", "node.Labels", util.ToJson(node.Labels))
 
 		// setNode annotations
 		if nu.Spec.SetNode.Annotations != nil {
@@ -549,4 +589,13 @@ func HashAutoFindKeys(keyslices []string) string {
 		h.Write([]byte(key))
 	}
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+func TaintInSlices(taintSlice []corev1.Taint, target corev1.Taint) bool {
+	for _, t := range taintSlice {
+		if t.Key == target.Key && t.Effect == target.Effect && t.Value == target.Value {
+			return true
+		}
+	}
+	return false
 }

@@ -39,13 +39,13 @@ const (
 type Workload struct {
 	// workload name
 	// +optional
-	Name string `json:"name"`
+	Name string `json:"name,omitempty"`
 	// workload type, Value can be pod, deploy, ds, service, job, st
 	// +optional
-	Type WorkloadType `json:"type"`
+	Type WorkloadType `json:"type,omitempty"`
 	// If specified, Label selector for workload.
 	// +optional
-	Selector *Selector `json:"selector"`
+	Selector *Selector `json:"selector,omitempty"`
 }
 
 // NodeGroupSpec defines the desired state of NodeGroup
@@ -60,7 +60,7 @@ type NodeGroupSpec struct {
 
 	// If specified, create new NodeUnits based on node have same label keys, for different values will create different nodeunites
 	// +optional
-	AutoFindNodeKeys []string `json:"autoFindNodekeys,omitempty"`
+	AutoFindNodeKeys []string `json:"autoFindNodeKeys,omitempty"`
 
 	// If specified, Nodegroup bound workload
 	// +optional
@@ -85,7 +85,7 @@ type NodeGroupStatus struct {
 	// NodeUnit that is number in nodegroup
 	//+kubebuilder:default=0
 	// +optional
-	UnitNumber int `json:"unitNumber"`
+	UnitNumber int `json:"unitNumber,omitempty"`
 	// Nodeunit contained in nodegroup
 	// +optional
 	NodeUnits []string `json:"nodeUnits,omitempty"`
@@ -99,6 +99,7 @@ type NodeGroupStatus struct {
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:storageversion
 // +kubebuilder:resource:shortName=ng,scope=Cluster,path=nodegroups,categories=all
 // +kubebuilder:printcolumn:name="UNITS",type="integer",JSONPath=`.status.unitNumber`
 // +kubebuilder:printcolumn:name="AGE",type="date",JSONPath=".metadata.creationTimestamp"
@@ -113,7 +114,7 @@ type NodeGroup struct {
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 // +kubebuilder:object:root=true
-
+// +kubebuilder:storageversion
 // NodeGroupList contains a list of NodeGroup
 type NodeGroupList struct {
 	metav1.TypeMeta `json:",inline"`
@@ -159,10 +160,10 @@ const (
 // ClusterCondition contains details for the current condition of this cluster.
 type ClusterCondition struct {
 	// Type is the type of the condition.
-	Type string `json:"type"`
+	Type string `json:"type,omitempty"`
 	// Status is the status of the condition.
 	// Can be True, False, Unknown.
-	Status ConditionStatus `json:"status"`
+	Status ConditionStatus `json:"status,omitempty"`
 	// Last time we probed the condition.
 	// +optional
 	LastProbeTime metav1.Time `json:"lastProbeTime,omitempty"`
@@ -221,11 +222,11 @@ const (
 // ClusterAddress contains information for the cluster's address.
 type ClusterAddress struct {
 	// Cluster address type, one of Public, ExternalIP or InternalIP.
-	Type AddressType `json:"type"`
+	Type AddressType `json:"type,omitempty"`
 	// The cluster address.
-	Host string `json:"host"`
-	Port int32  `json:"port"`
-	Path string `json:"path"`
+	Host string `json:"host,omitempty"`
+	Port int32  `json:"port,omitempty"`
+	Path string `json:"path,omitempty"`
 }
 
 // ResourceList is a set of (resource name, quantity) pairs.
@@ -334,7 +335,7 @@ type NodeUnitSpec struct {
 type UnitClusterStatus struct {
 	// If AutonomyLevel larger than L3, it will create a independent control plane in unit,
 	// +optional
-	Version string `json:"version"`
+	Version string `json:"version,omitempty"`
 	// +optional
 	Phase ClusterPhase `json:"phase,omitempty"`
 	// +optional
@@ -354,7 +355,7 @@ type NodeUnitStatus struct {
 	// Node that is ready in nodeunit
 	//+kubebuilder:default='1/1'
 	// +optional
-	ReadyRate string `json:"readyRate"`
+	ReadyRate string `json:"readyRate,omitempty"`
 	// Node selected by nodeunit
 	// +optional
 	ReadyNodes []string `json:"readyNodes,omitempty"`
@@ -373,6 +374,7 @@ type NodeUnitStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:shortName=nu,scope=Cluster
+// +kubebuilder:storageversion
 // +kubebuilder:printcolumn:name="TYPE",type="string",JSONPath=`.spec.type`
 // +kubebuilder:printcolumn:name="READY",type="string",JSONPath=`.status.readyRate`
 // +kubebuilder:printcolumn:name="AGE",type="date",JSONPath=".metadata.creationTimestamp"
@@ -388,7 +390,7 @@ type NodeUnit struct {
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 // +kubebuilder:object:root=true
-
+// +kubebuilder:storageversion
 // NodeUnitList contains a list of NodeUnit
 type NodeUnitList struct {
 	metav1.TypeMeta `json:",inline"`

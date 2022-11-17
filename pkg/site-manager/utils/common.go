@@ -3,7 +3,7 @@ package utils
 import (
 	"context"
 
-	sitev1 "github.com/superedge/superedge/pkg/site-manager/apis/site.superedge.io/v1alpha1"
+	sitev1 "github.com/superedge/superedge/pkg/site-manager/apis/site.superedge.io/v1alpha2"
 	crdClientset "github.com/superedge/superedge/pkg/site-manager/generated/clientset/versioned"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
@@ -25,7 +25,7 @@ func CreateDefaultUnit(crdClient *crdClientset.Clientset) error {
 	}
 	allNodeUnit := &sitev1.NodeUnit{
 		TypeMeta: metav1.TypeMeta{
-			APIVersion: "site.superedge.io/v1alpha1",
+			APIVersion: "site.superedge.io/v1alpha2",
 			Kind:       "NodeUnit",
 		},
 		ObjectMeta: metav1.ObjectMeta{
@@ -37,7 +37,7 @@ func CreateDefaultUnit(crdClient *crdClientset.Clientset) error {
 		},
 	}
 
-	if _, err := crdClient.SiteV1alpha1().NodeUnits().Create(context.TODO(), allNodeUnit, metav1.CreateOptions{}); err != nil {
+	if _, err := crdClient.SiteV1alpha2().NodeUnits().Create(context.TODO(), allNodeUnit, metav1.CreateOptions{}); err != nil {
 		klog.Warningf("Create default %s unit error : %#v", AllNodeUnit, err)
 	}
 

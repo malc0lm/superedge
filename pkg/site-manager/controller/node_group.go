@@ -32,12 +32,10 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
-	appinformers "k8s.io/client-go/informers/apps/v1"
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	v1 "k8s.io/client-go/kubernetes/typed/core/v1"
-	applisters "k8s.io/client-go/listers/apps/v1"
 	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
@@ -60,9 +58,6 @@ type NodeGroupController struct {
 	nodeLister       corelisters.NodeLister
 	nodeListerSynced cache.InformerSynced
 
-	dsListter      applisters.DaemonSetLister
-	dsListerSynced cache.InformerSynced
-
 	nodeUnitLister       crdv1listers.NodeUnitLister
 	nodeUnitListerSynced cache.InformerSynced
 
@@ -81,7 +76,6 @@ type NodeGroupController struct {
 
 func NewNodeGroupController(
 	nodeInformer coreinformers.NodeInformer,
-	dsInformer appinformers.DaemonSetInformer,
 	nodeUnitInformer crdinformers.NodeUnitInformer,
 	nodeGroupInformer crdinformers.NodeGroupInformer,
 	kubeClient clientset.Interface,
@@ -97,8 +91,8 @@ func NewNodeGroupController(
 	groupController := &NodeGroupController{
 		kubeClient:    kubeClient,
 		crdClient:     crdClient,
-		eventRecorder: eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "site-manager-daemon"}),
-		queue:         workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "site-manager-daemon"),
+		eventRecorder: eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "nodegroup-controller"}),
+		queue:         workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "nodegroup-controller"),
 	}
 
 	nodeUnitInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -134,17 +128,17 @@ func (c *NodeGroupController) Run(workers, syncPeriodAsWhole int, stopCh <-chan 
 	defer utilruntime.HandleCrash()
 	defer c.queue.ShutDown()
 
-	klog.V(1).Infof("Starting site-manager daemon")
-	defer klog.V(1).Infof("Shutting down site-manager daemon")
+	klog.V(1).Infof("Starting NodeGroupController")
+	defer klog.V(1).Infof("Shutting down NodeGroupController")
 
-	if !cache.WaitForNamedCacheSync("site-manager-daemon", stopCh,
+	if !cache.WaitForNamedCacheSync("NodeGroupController", stopCh,
 		c.nodeListerSynced, c.nodeUnitListerSynced, c.nodeGroupListerSynced) {
 		return
 	}
 
 	for i := 0; i < workers; i++ {
 		go wait.Until(c.worker, time.Second, stopCh)
-		klog.V(4).Infof("Site-manager set worker-%d success", i)
+		klog.V(4).Infof("NodeGroupController set worker-%d success", i)
 	}
 
 	<-stopCh
@@ -385,7 +379,8 @@ func (c *NodeGroupController) reconcileNodeGroup(ng *sitev1alpha2.NodeGroup) err
 	// 1. ensure  node unit which not belong to this group
 	currentUnitSet := sets.NewString()
 
-	var currentUnitMap, gcUnitMap map[string]*sitev1alpha2.NodeUnit
+	currentUnitMap := make(map[string]*sitev1alpha2.NodeUnit)
+	gcUnitMap := make(map[string]*sitev1alpha2.NodeUnit)
 	unitLabelSelector := &metav1.LabelSelector{
 		MatchLabels: map[string]string{ng.Name: constant.NodeGroupSuperedge},
 	}
@@ -428,9 +423,10 @@ func (c *NodeGroupController) reconcileNodeGroup(ng *sitev1alpha2.NodeGroup) err
 	if err != nil {
 		return err
 	}
-	ng.Status = *newStatus
 
-	if !reflect.DeepEqual(*newStatus, ng.Status) {
+	if !reflect.DeepEqual(newStatus, &ng.Status) {
+		ng.Status = *newStatus
+
 		// update node unit status only when status changed
 		_, err = c.crdClient.SiteV1alpha2().NodeGroups().UpdateStatus(context.TODO(), ng, metav1.UpdateOptions{})
 		if err != nil {
@@ -438,7 +434,7 @@ func (c *NodeGroupController) reconcileNodeGroup(ng *sitev1alpha2.NodeGroup) err
 			return err
 		}
 	}
-	klog.V(5).Infof("NodeGroup=(%s) update success", ng.Name)
+	klog.V(4).InfoS("NodeGroup update success", "node group", ng.Name)
 	return nil
 }
 
@@ -468,7 +464,8 @@ func (c *NodeGroupController) updateNodeUnit(oldObj interface{}, newObj interfac
 	}
 	klog.V(5).InfoS("Updating NodeUnit", "old node unit", klog.KObj(oldNu), "new node unit", klog.KObj(newNu))
 
-	var oldGroupLabel, newGroupLabel map[string]string
+	oldGroupLabel := make(map[string]string)
+	newGroupLabel := make(map[string]string)
 	for k, v := range oldNu.Labels {
 		if v == constant.NodeGroupSuperedge {
 			oldGroupLabel[k] = v
@@ -612,7 +609,7 @@ func withCheckSize(name string) bool {
 func (c *NodeGroupController) newNodeUnit(ng *sitev1alpha2.NodeGroup, newname string, keyslices []string, sel map[string]string) error {
 
 	klog.V(4).Infof("prepare to ceate nodeUnite: %s, selector: %s", newname, sel)
-	var nuLabel = make(map[string]string)
+	nuLabel := make(map[string]string)
 	nuLabel[constant.NodeUnitAutoFindLabel] = utils.HashAutoFindKeys(keyslices)
 	nuLabel[ng.Name] = constant.NodeGroupSuperedge
 
@@ -670,7 +667,7 @@ func checkOwnerReferenceContains(owner metav1.OwnerReference, tmpSlice []metav1.
 
 func checkIfContains(nodelabel map[string]string, keyslices []string) (bool, string, map[string]string) {
 	var res string
-	var sel = make(map[string]string)
+	sel := make(map[string]string)
 	sort.Strings(keyslices)
 	for _, value := range keyslices {
 		if _, ok := nodelabel[value]; ok {

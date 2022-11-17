@@ -9,13 +9,11 @@ require (
 	github.com/davecgh/go-spew v1.1.1
 	github.com/dgraph-io/badger/v3 v3.2011.1
 	github.com/golang/protobuf v1.5.2
-	github.com/google/flatbuffers v1.12.1 // indirect
 	github.com/google/uuid v1.1.2
 	github.com/hashicorp/go-multierror v1.1.0
 	github.com/moby/term v0.0.0-20210610120745-9d4ed1856297
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822
 	github.com/pelletier/go-toml v1.2.0
-	github.com/pingcap/errors v0.11.4
 	github.com/pkg/errors v0.9.1
 	github.com/prometheus/client_golang v1.11.0
 	github.com/satori/go.uuid v1.2.0
@@ -24,9 +22,10 @@ require (
 	github.com/tarscloud/gopractice v1.0.1
 	github.com/tatsushid/go-fastping v0.0.0-20160109021039-d7bb493dee3e
 	go.etcd.io/bbolt v1.3.6
-	golang.org/x/crypto v0.0.0-20210220033148-5ea612d1eb83
+	golang.org/x/crypto v0.1.0
+	golang.org/x/exp v0.0.0-20221114191408-850992195362 // indirect
 	golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d
-	golang.org/x/sys v0.0.0-20210909193231-528a39cd75f3
+	golang.org/x/sys v0.1.0
 	google.golang.org/grpc v1.38.0
 	gopkg.in/square/go-jose.v2 v2.2.2
 	gopkg.in/yaml.v2 v2.4.0
@@ -37,9 +36,10 @@ require (
 	k8s.io/apiserver v0.22.3
 	k8s.io/client-go v0.22.3
 	k8s.io/cluster-bootstrap v0.22.3
-	k8s.io/code-generator v0.22.3
 	k8s.io/component-base v0.22.3
 	k8s.io/klog/v2 v2.9.0
 	sigs.k8s.io/controller-runtime v0.10.3
 	sigs.k8s.io/yaml v1.2.0
 )
+
+require github.com/google/flatbuffers v1.12.1 // indirect

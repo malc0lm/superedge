@@ -19,6 +19,7 @@ limitations under the License.
 package v1alpha2
 
 import (
+	"github.com/superedge/superedge/pkg/site-manager/constant"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -38,7 +39,7 @@ func Resource(resource string) schema.GroupResource {
 }
 
 var (
-	SchemeBuilder = runtime.NewSchemeBuilder(addKnownTypes)
+	SchemeBuilder = runtime.NewSchemeBuilder(addKnownTypes, registerDefaults)
 	AddToScheme   = SchemeBuilder.AddToScheme
 )
 
@@ -53,3 +54,21 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 	metav1.AddToGroupVersion(scheme, SchemeGroupVersion)
 	return nil
 }
+
+func registerDefaults(scheme *runtime.Scheme) error {
+	scheme.AddTypeDefaultingFunc(&NodeUnit{}, func(obj interface{}) { SetObjectDefaults_NodeUnit(obj.(*NodeUnit)) })
+	return nil
+}
+
+func SetObjectDefaults_NodeUnit(in *NodeUnit) {
+	SetDefaults_NodeUnitSpec(in)
+	SetDefaults_NodeUnitStatus(&in.Status)
+}
+
+func SetDefaults_NodeUnitSpec(in *NodeUnit) {
+	if _, ok := in.Spec.SetNode.Labels[in.Name]; !ok {
+		in.Spec.SetNode.Labels[in.Name] = constant.NodeUnitSuperedge
+	}
+}
+
+func SetDefaults_NodeUnitStatus(in *NodeUnitStatus) {}

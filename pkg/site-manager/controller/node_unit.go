@@ -24,7 +24,6 @@ import (
 
 	"github.com/superedge/superedge/pkg/site-manager/constant"
 	deleter "github.com/superedge/superedge/pkg/site-manager/controller/deleter"
-	"github.com/superedge/superedge/pkg/site-manager/controller/gc"
 
 	crdClientset "github.com/superedge/superedge/pkg/site-manager/generated/clientset/versioned"
 	crdinformers "github.com/superedge/superedge/pkg/site-manager/generated/informers/externalversions/site.superedge.io/v1alpha2"
@@ -54,6 +53,7 @@ import (
 
 	sitev1alpha2 "github.com/superedge/superedge/pkg/site-manager/apis/site.superedge.io/v1alpha2"
 	"github.com/superedge/superedge/pkg/site-manager/utils"
+	"github.com/superedge/superedge/pkg/util"
 )
 
 type NodeUnitController struct {
@@ -74,10 +74,9 @@ type NodeUnitController struct {
 	syncHandler     func(key string) error
 	enqueueNodeUnit func(name string)
 	nodeUnitDeleter *deleter.NodeUnitDeleter
-	nodegc          *gc.NodeUnitGarbageCollector
 }
 
-func NewSitesManagerDaemonController(
+func NewNodeUnitController(
 	nodeInformer coreinformers.NodeInformer,
 	dsInformer appinformers.DaemonSetInformer,
 	nodeUnitInformer crdinformers.NodeUnitInformer,
@@ -95,8 +94,8 @@ func NewSitesManagerDaemonController(
 	nodeUnitController := &NodeUnitController{
 		kubeClient:    kubeClient,
 		crdClient:     crdClient,
-		eventRecorder: eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "site-manager-daemon"}),
-		queue:         workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "site-manager-daemon"),
+		eventRecorder: eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "nodeunit-controller"}),
+		queue:         workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "nodeunit-controller"),
 	}
 
 	nodeInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -126,7 +125,14 @@ func NewSitesManagerDaemonController(
 	nodeUnitController.nodeUnitLister = nodeUnitInformer.Lister()
 	nodeUnitController.nodeUnitListerSynced = nodeUnitInformer.Informer().HasSynced
 
-	nodeUnitController.nodeUnitDeleter = deleter.NewNodeUnitDeleter(kubeClient, crdClient, nodeInformer.Lister(), NodeUnitFinalizerID)
+	nodeUnitController.nodeUnitDeleter = deleter.NewNodeUnitDeleter(
+		kubeClient,
+		crdClient,
+		nodeInformer.Lister(),
+		nodeInformer.Informer().HasSynced,
+		NodeUnitFinalizerID,
+		workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "nodeunit-deleter"),
+	)
 	klog.V(4).Infof("Site-manager set handler success")
 
 	return nodeUnitController
@@ -148,6 +154,8 @@ func (c *NodeUnitController) Run(workers, syncPeriodAsWhole int, stopCh <-chan s
 		go wait.Until(c.worker, time.Second, stopCh)
 		klog.V(4).Infof("Site-manager set worker-%d success", i)
 	}
+	// run deleter
+	c.nodeUnitDeleter.Run(stopCh)
 
 	<-stopCh
 }
@@ -201,7 +209,32 @@ func (c *NodeUnitController) addNodeUnit(obj interface{}) {
 }
 func (c *NodeUnitController) updateNodeUnit(oldObj interface{}, newObj interface{}) {
 	oldNu, newNu := oldObj.(*sitev1alpha2.NodeUnit), newObj.(*sitev1alpha2.NodeUnit)
-	klog.V(5).InfoS("Updating NodeUnit", "old node unit", klog.KObj(oldNu), "new node unit", klog.KObj(newNu))
+	// check if old nodeunit setNode update, and should not in node
+	needClearNu := oldNu.DeepCopy()
+	clearLabel := make(map[string]string)
+	clearAnno := make(map[string]string)
+	clearTaint := make([]corev1.Taint, 0, 2)
+	for k, v := range oldNu.Spec.SetNode.Labels {
+		if _, ok := newNu.Spec.SetNode.Labels[k]; !ok {
+			clearLabel[k] = v
+		}
+	}
+	for k, v := range oldNu.Spec.SetNode.Annotations {
+		if _, ok := newNu.Spec.SetNode.Annotations[k]; !ok {
+			clearAnno[k] = v
+		}
+	}
+	for _, t := range oldNu.Spec.SetNode.Taints {
+		if !utils.TaintInSlices(newNu.Spec.SetNode.Taints, t) {
+			clearTaint = append(clearTaint, t)
+		}
+	}
+	needClearNu.Spec.SetNode.Labels = clearLabel
+	needClearNu.Spec.SetNode.Annotations = clearAnno
+	needClearNu.Spec.SetNode.Taints = clearTaint
+	c.nodeUnitDeleter.Delete(needClearNu)
+
+	klog.V(5).InfoS("Updating NodeUnit", "old node unit", klog.KObj(oldNu), "new node unit", klog.KObj(newNu), "need clear setnode", util.ToJson(needClearNu.Spec.SetNode))
 	c.enqueueNodeUnit(newNu.Name)
 }
 func (c *NodeUnitController) deleteNodeUnit(obj interface{}) {
@@ -249,7 +282,8 @@ func (c *NodeUnitController) updateNode(oldObj, newObj interface{}) {
 	}
 	klog.V(5).InfoS("Updating Node", "old node", klog.KObj(oldNode), "new node", klog.KObj(newNode))
 
-	var oldUnitLabel, newUnitLabel map[string]string
+	oldUnitLabel := make(map[string]string)
+	newUnitLabel := make(map[string]string)
 	for k, v := range oldNode.Labels {
 		if v == constant.NodeUnitSuperedge {
 			oldUnitLabel[k] = v
@@ -343,7 +377,7 @@ func (c *NodeUnitController) syncUnit(key string) error {
 		// The object is being deleted
 		if controllerutil.ContainsFinalizer(nu, NodeUnitFinalizerID) {
 			// our finalizer is present, so lets handle any external dependency
-			if err := c.nodeUnitDeleter.Delete(context.TODO(), nu); err != nil {
+			if err := c.nodeUnitDeleter.Delete(nu); err != nil {
 				// if fail to delete the external dependency here, return with error
 				// so that it can be retried
 				return err
@@ -573,15 +607,14 @@ func (c *NodeUnitController) enqueue(name string) {
 
 func (c *NodeUnitController) reconcileNodeUnit(nu *sitev1alpha2.NodeUnit) error {
 
-	// malc TODO: set node role? why?
-
 	// 0. list nodemap and nodeset belong to current node unit
-
 	unitNodeSet, nodeMap, err := utils.GetNodesByUnit(c.nodeLister, nu)
 	// 1. check nodes which should not belong to this unit, clear them(this will use gc)
+
 	currentNodeSet := sets.NewString()
 
-	var currentNodeMap, gcNodeMap map[string]*corev1.Node
+	currentNodeMap := make(map[string]*corev1.Node)
+	gcNodeMap := make(map[string]*corev1.Node)
 	currentNodeSelector := labels.NewSelector()
 	nRequire, err := labels.NewRequirement(
 		nu.Name,
@@ -611,7 +644,23 @@ func (c *NodeUnitController) reconcileNodeUnit(nu *sitev1alpha2.NodeUnit) error 
 	}
 
 	// 2. check node which should belong to this unit, ensure setNode(default is label)
-	// 2 set node
+	// 2.1 set node unit default value
+	if v, ok := nu.Spec.SetNode.Labels[nu.Name]; !ok || v != constant.NodeUnitSuperedge {
+		klog.V(5).InfoS("NodeUnit init, setnode default label", "node unit", nu.Name)
+		if nu.Spec.SetNode.Labels == nil {
+			nu.Spec.SetNode.Labels = make(map[string]string)
+		}
+		nu.Spec.SetNode.Labels[nu.Name] = constant.NodeUnitSuperedge
+		_, err = c.crdClient.SiteV1alpha2().NodeUnits().Update(context.TODO(), nu, metav1.UpdateOptions{})
+		if err != nil {
+			klog.Errorf("Update nodeUnit: %s error: %#v", nu.Name, err)
+			return err
+		}
+		// first set default label,when nodeunit created, reconcile next.
+		return nil
+	}
+
+	// 2.2 setnode to node
 	if err := utils.SetNodeToNodes(c.kubeClient, nu, nodeMap); err != nil {
 		return err
 	}
@@ -620,17 +669,18 @@ func (c *NodeUnitController) reconcileNodeUnit(nu *sitev1alpha2.NodeUnit) error 
 	if err != nil {
 		return nil
 	}
-	nu.Status = *newStatus
 
-	if !reflect.DeepEqual(*newStatus, nu.Status) {
+	if !reflect.DeepEqual(newStatus, &nu.Status) || !reflect.DeepEqual(newStatus, &nu.Status) {
+		nu.Status = *newStatus
 		// update node unit status only when status changed
 		_, err = c.crdClient.SiteV1alpha2().NodeUnits().UpdateStatus(context.TODO(), nu, metav1.UpdateOptions{})
 		if err != nil {
-			klog.Errorf("Update nodeUnit: %s error: %#v", nu.Name, err)
+			klog.Errorf("Update nodeUnit status: %s error: %#v", nu.Name, err)
 			return err
 		}
 	}
-	klog.V(5).Infof("NodeUnit=(%s) update success", nu.Name)
+
+	klog.V(4).InfoS("NodeUnit update success", "node unit", nu.Name)
 
 	return nil
 }

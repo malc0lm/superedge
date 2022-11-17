@@ -148,9 +148,17 @@ func runController(parent context.Context, kubeClient *clientset.Clientset,
 	crdClient *crdclientset.Clientset, workerNum, syncPeriod, syncPeriodAsWhole int) {
 
 	controllerConfig := config.NewControllerConfig(kubeClient, crdClient, time.Second*time.Duration(syncPeriod))
-	sitesManagerDaemonController := controller.NewSitesManagerDaemonController(
+	nuc := controller.NewNodeUnitController(
 		controllerConfig.NodeInformer,
 		controllerConfig.DaemonSetInformer,
+		controllerConfig.NodeUnitInformer,
+		controllerConfig.NodeGroupInformer,
+		kubeClient,
+		crdClient,
+	)
+
+	ngc := controller.NewNodeGroupController(
+		controllerConfig.NodeInformer,
 		controllerConfig.NodeUnitInformer,
 		controllerConfig.NodeGroupInformer,
 		kubeClient,
@@ -161,7 +169,9 @@ func runController(parent context.Context, kubeClient *clientset.Clientset,
 	defer cancel()
 
 	controllerConfig.Run(ctx.Done())
-	go sitesManagerDaemonController.Run(workerNum, syncPeriodAsWhole, ctx.Done())
+	go nuc.Run(workerNum, syncPeriodAsWhole, ctx.Done())
+	go ngc.Run(workerNum, syncPeriodAsWhole, ctx.Done())
+
 	<-ctx.Done()
 }
 
