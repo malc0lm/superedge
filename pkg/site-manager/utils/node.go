@@ -4,7 +4,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
-	"encoding/json"
+	"fmt"
 	"sort"
 
 	"github.com/superedge/superedge/pkg/site-manager/apis/site.superedge.io/v1alpha2"
@@ -22,9 +22,60 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	clientset "k8s.io/client-go/kubernetes"
 	corelisters "k8s.io/client-go/listers/core/v1"
+	"k8s.io/client-go/tools/cache"
 
 	"k8s.io/klog/v2"
 )
+
+func CaculateNodeUnitStatus(nodeMap map[string]*corev1.Node, nu *sitev1.NodeUnit) (*sitev1.NodeUnitStatus, error) {
+	status := &sitev1.NodeUnitStatus{}
+	var readyList, notReadyList []string
+	for k, v := range nodeMap {
+		if utilkube.IsReadyNode(v) {
+			readyList = append(readyList, k)
+		} else {
+			notReadyList = append(notReadyList, k)
+		}
+	}
+	sort.Strings(readyList)
+	sort.Strings(notReadyList)
+	status.ReadyNodes = readyList
+	status.NotReadyNodes = notReadyList
+	status.ReadyRate = fmt.Sprintf("%d/%d", len(readyList), len(readyList)+len(notReadyList))
+
+	return status, nil
+}
+
+func CaculateNodeGroupStatus(unitSet sets.String, ng *sitev1.NodeGroup) (*sitev1.NodeGroupStatus, error) {
+	status := &sitev1.NodeGroupStatus{}
+	status.NodeUnits = unitSet.List()
+	status.UnitNumber = unitSet.Len()
+	return status, nil
+}
+
+func ListNodeFromLister(nodeLister corelisters.NodeLister, selector labels.Selector, appendFn cache.AppendFunc) error {
+
+	nodes, err := nodeLister.List(selector)
+	if err != nil {
+		return err
+	}
+	for _, n := range nodes {
+		appendFn(n)
+	}
+	return nil
+}
+
+func ListNodeUnitFromLister(unitLister crdv1listers.NodeUnitLister, selector labels.Selector, appendFn cache.AppendFunc) error {
+
+	units, err := unitLister.List(selector)
+	if err != nil {
+		return err
+	}
+	for _, n := range units {
+		appendFn(n)
+	}
+	return nil
+}
 
 // GetUnitsByNode
 func GetGroupsByUnit(groupLister crdv1listers.NodeGroupLister, nu *sitev1.NodeUnit) (nodeGroups []*sitev1.NodeGroup, groupList []string, err error) {
@@ -192,147 +243,6 @@ func GetNodesByUnit(nodeLister corelisters.NodeLister, nu *sitev1.NodeUnit) (set
 	return unitNodeSet, nodeMap, nil
 }
 
-/*
-  Nodes Annotations
-*/
-
-func AddNodesAnnotations(kubeClient clientset.Interface, nodeNames []string, annotations []string) error {
-	for _, nodeName := range nodeNames {
-		node, err := kubeClient.CoreV1().Nodes().Get(context.TODO(), nodeName, metav1.GetOptions{})
-		if err != nil {
-			klog.Errorf("Get Node: %s, error: %#v", nodeName, err)
-			continue
-		}
-
-		if err := AddNodeAnnotations(kubeClient, node, annotations); err != nil {
-			klog.Errorf("Update Node: %s, error: %#v", node.Name, err)
-			return err
-		}
-	}
-
-	return nil
-}
-
-func RemoveNodesAnnotations(kubeClient clientset.Interface, nodeNames []string, annotations []string) {
-	for _, nodeName := range nodeNames {
-		node, err := kubeClient.CoreV1().Nodes().Get(context.TODO(), nodeName, metav1.GetOptions{})
-		if err != nil {
-			klog.Errorf("Get Node: %s, error: %#v", nodeName, err)
-			continue
-		}
-
-		if err := RemoveNodeAnnotations(kubeClient, node, annotations); err != nil {
-			klog.Errorf("Remove node: %s annotations nodeunit: %s flags error: %#v", nodeName, annotations, err)
-			continue
-		}
-	}
-}
-
-/*
-  Node Annotations
-*/
-
-func AddNodeAnnotations(kubeclient clientset.Interface, node *corev1.Node, annotations []string) error {
-	if node.Annotations == nil {
-		node.Annotations = make(map[string]string)
-	}
-
-	var nodeUnits []string
-	value, ok := node.Annotations[constant.NodeUnitSuperedge]
-	if ok && value != "\"\"" && value != "null" { // nil annotations Unmarshal can be failed
-		if err := json.Unmarshal(json.RawMessage(value), &nodeUnits); err != nil {
-			klog.Errorf("Unmarshal node: %s annotations: %s, error: %#v", node.Name, util.ToJson(value), err)
-			return err
-		}
-	}
-
-	nodeUnits = append(nodeUnits, annotations...)
-	nodeUnits = util.RemoveDuplicateElement(nodeUnits)
-	nodeUnits = util.DeleteSliceElement(nodeUnits, "")
-	node.Annotations[constant.NodeUnitSuperedge] = util.ToJson(nodeUnits)
-	if _, err := kubeclient.CoreV1().Nodes().Update(context.TODO(), node, metav1.UpdateOptions{}); err != nil {
-		klog.Errorf("Update Node: %s, error: %#v", node.Name, err)
-		return err
-	}
-
-	return nil
-}
-
-func RemoveNodeAnnotations(kubeclient clientset.Interface, node *corev1.Node, annotations []string) error {
-	if node.Annotations == nil {
-		node.Annotations = make(map[string]string)
-	}
-
-	var nodeUnits []string
-	value, ok := node.Annotations[constant.NodeUnitSuperedge]
-	if ok && value != "\"\"" && value != "null" { // nil annotations Unmarshal can be failed
-		if err := json.Unmarshal(json.RawMessage(value), &nodeUnits); err != nil {
-			klog.Errorf("Unmarshal node: %s annotations: %s, error: %#v", node.Name, util.ToJson(value), err)
-			return err
-		}
-	}
-
-	for _, annotation := range annotations {
-		nodeUnits = util.DeleteSliceElement(nodeUnits, annotation)
-	}
-	nodeUnits = util.DeleteSliceElement(nodeUnits, "")
-	node.Annotations[constant.NodeUnitSuperedge] = util.ToJson(nodeUnits)
-	if _, err := kubeclient.CoreV1().Nodes().Update(context.TODO(), node, metav1.UpdateOptions{}); err != nil {
-		klog.Errorf("Update Node: %s, error: %#v", node.Name, err)
-		return err
-	}
-
-	return nil
-}
-
-func ResetNodeUnitAnnotations(kubeclient clientset.Interface, node *corev1.Node, annotations []string) error {
-	if node.Annotations == nil {
-		node.Annotations = make(map[string]string)
-	}
-	annotations = util.DeleteSliceElement(annotations, "")
-	node.Annotations[constant.NodeUnitSuperedge] = util.ToJson(annotations)
-	if _, err := kubeclient.CoreV1().Nodes().Update(context.TODO(), node, metav1.UpdateOptions{}); err != nil {
-		klog.Errorf("Update Node: %s, error: %#v", node.Name, err)
-		return err
-	}
-
-	return nil
-}
-
-const (
-	KubernetesEdgeNodeRoleKey   = "node-role.kubernetes.io/Edge"
-	KubernetesCloudNodeRoleKey  = "node-role.kubernetes.io/Cloud"
-	KubernetesMasterNodeRoleKey = "node-role.kubernetes.io/Master"
-)
-
-func SetNodeRole(kubeClient clientset.Interface, node *corev1.Node) error {
-	if node.Labels == nil {
-		node.Labels = make(map[string]string)
-	}
-
-	if _, ok := node.Labels[util.EdgeNodeLabelKey]; ok {
-		edgeNodeLabel := map[string]string{
-			KubernetesEdgeNodeRoleKey: "",
-		}
-		if err := utilkube.AddNodeLabel(kubeClient, node.Name, edgeNodeLabel); err != nil {
-			klog.Errorf("Add edge Node role label error: %v", err)
-			return err
-		}
-	}
-
-	if _, ok := node.Labels[util.CloudNodeLabelKey]; ok {
-		cloudNodeLabel := map[string]string{
-			KubernetesCloudNodeRoleKey: "",
-		}
-		if err := utilkube.AddNodeLabel(kubeClient, node.Name, cloudNodeLabel); err != nil {
-			klog.Errorf("Add Cloud node label error: %v", err)
-			return err
-		}
-	}
-
-	return nil
-}
-
 func SetNodeToNodes(kubeClient clientset.Interface, nu *sitev1.NodeUnit, nodeMaps map[string]*corev1.Node) error {
 	klog.V(4).InfoS("SetNodeToNodes SetNode", "nu.Spec.SetNode", util.ToJson(nu.Spec.SetNode))
 	for _, node := range nodeMaps {
@@ -465,86 +375,6 @@ func DeleteNodeUnitFromSetNode(crdClient *crdClientset.Clientset, ng *sitev1.Nod
 	return nil
 }
 
-func SetUpdatedValue(oldValues map[string]string, curValues map[string]string, modifyValues *map[string]string) {
-	// delete old values
-	for k, _ := range oldValues {
-		if _, found := (*modifyValues)[k]; found {
-			delete((*modifyValues), k)
-		}
-	}
-
-	// set new values
-	for k, v := range curValues {
-		(*modifyValues)[k] = v
-	}
-}
-
-func UpdtateNodeFromSetNode(kubeClient clientset.Interface, oldSetNode sitev1.SetNode, curSetNode sitev1.SetNode, nodeNames []string) {
-	for _, nodeName := range nodeNames {
-		node, err := kubeClient.CoreV1().Nodes().Get(context.TODO(), nodeName, metav1.GetOptions{})
-		if err != nil {
-			klog.Errorf("Get node: %s error: %s", node.Name, err)
-			continue
-		}
-
-		if node.Labels == nil {
-			node.Labels = make(map[string]string)
-		}
-		SetUpdatedValue(oldSetNode.Labels, curSetNode.Labels, &node.Labels)
-
-		if node.Annotations == nil {
-			node.Annotations = make(map[string]string)
-		}
-		SetUpdatedValue(oldSetNode.Annotations, curSetNode.Annotations, &node.Annotations)
-
-		if node.Spec.Taints == nil {
-			node.Spec.Taints = []corev1.Taint{}
-			node.Spec.Taints = append(node.Spec.Taints, curSetNode.Taints...)
-		} else {
-			node.Spec.Taints = updateTaintItems(node.Spec.Taints, oldSetNode.Taints, curSetNode.Taints)
-		}
-
-		if _, err := kubeClient.CoreV1().Nodes().Update(context.TODO(), node, metav1.UpdateOptions{}); err != nil {
-			klog.Errorf("Update Node: %s, error: %#v", node.Name, err)
-			continue
-		}
-	}
-}
-
-func updateTaintItems(currTaintItems []corev1.Taint, oldTaintItems []corev1.Taint, newTaintItems []corev1.Taint) []corev1.Taint {
-
-	deletedResults := []corev1.Taint{}
-	Results := []corev1.Taint{}
-
-	newMap := make(map[string]bool)
-	for _, s := range newTaintItems {
-		newMap[s.Key] = true
-	}
-
-	deleteMap := make(map[string]bool)
-	for _, s := range oldTaintItems {
-		deleteMap[s.Key] = true
-	}
-
-	// filter old values
-	for _, val := range currTaintItems {
-		if _, ok := deleteMap[val.Key]; ok {
-			continue
-		}
-		deletedResults = append(deletedResults, val)
-	}
-	// filter new values
-	for _, val := range deletedResults {
-		if _, ok := newMap[val.Key]; ok {
-			continue
-		}
-		Results = append(Results, val)
-	}
-
-	Results = append(Results, newTaintItems...)
-	return Results
-}
-
 func deleteTaintItems(currentTaintItems, deleteTaintItems []corev1.Taint) []corev1.Taint {
 	result := []corev1.Taint{}
 	deleteMap := make(map[string]bool)
@@ -560,22 +390,6 @@ func deleteTaintItems(currentTaintItems, deleteTaintItems []corev1.Taint) []core
 		}
 	}
 	return result
-}
-
-func NeedUpdateNode(nodeNamesOld, nodeNamesCur []string) (removeNodes []string, updateNodes []string) {
-	curNodesMap := make(map[string]bool, len(nodeNamesCur))
-	for _, nodeName := range nodeNamesCur {
-		curNodesMap[nodeName] = true
-	}
-
-	for _, nodeName := range nodeNamesOld {
-		if ok := curNodesMap[nodeName]; ok {
-			updateNodes = append(updateNodes, nodeName)
-		} else {
-			removeNodes = append(removeNodes, nodeName)
-		}
-	}
-	return
 }
 
 func HashAutoFindKeys(keyslices []string) string {
