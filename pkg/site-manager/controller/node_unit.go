@@ -52,7 +52,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	sitev1alpha2 "github.com/superedge/superedge/pkg/site-manager/apis/site.superedge.io/v1alpha2"
+	"github.com/superedge/superedge/pkg/site-manager/controller/unitcluster"
 	"github.com/superedge/superedge/pkg/site-manager/utils"
+
 	"github.com/superedge/superedge/pkg/util"
 )
 
@@ -74,6 +76,7 @@ type NodeUnitController struct {
 	syncHandler     func(key string) error
 	enqueueNodeUnit func(name string)
 	nodeUnitDeleter *deleter.NodeUnitDeleter
+	kinsController  *unitcluster.KinsController
 }
 
 func NewNodeUnitController(
@@ -132,6 +135,13 @@ func NewNodeUnitController(
 		nodeInformer.Informer().HasSynced,
 		NodeUnitFinalizerID,
 		workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "nodeunit-deleter"),
+	)
+	nodeUnitController.kinsController = unitcluster.NewKinsController(
+		kubeClient,
+		crdClient,
+		nodeInformer.Lister(),
+		dsInformer.Lister(),
+		nodeUnitInformer.Lister(),
 	)
 	klog.V(4).Infof("Site-manager set handler success")
 
@@ -438,6 +448,12 @@ func (c *NodeUnitController) reconcileNodeUnit(nu *sitev1alpha2.NodeUnit) error 
 	for _, gcNode := range needGCNodes.UnsortedList() {
 		gcNodeMap[gcNode] = currentNodeMap[gcNode]
 	}
+	klog.V(5).InfoS("get node after node selector",
+		"ensure nodes", unitNodeSet.UnsortedList(),
+		"current nodes", currentNodeSet.UnsortedList(),
+		"need gc nodes", needGCNodes.UnsortedList(),
+	)
+
 	if err := utils.DeleteNodesFromSetNode(c.kubeClient, nu, gcNodeMap); err != nil {
 		return err
 	}
@@ -461,6 +477,11 @@ func (c *NodeUnitController) reconcileNodeUnit(nu *sitev1alpha2.NodeUnit) error 
 
 	// 2.2 setnode to node
 	if err := utils.SetNodeToNodes(c.kubeClient, nu, nodeMap); err != nil {
+		return err
+	}
+
+	// 2.3 check node unit autonomy level if need install/uninstall unit cluster
+	if err := c.kinsController.ReconcileUnitCluster(nu); err != nil {
 		return err
 	}
 	// 3. caculate node unit status
