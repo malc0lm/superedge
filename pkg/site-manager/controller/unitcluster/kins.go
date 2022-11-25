@@ -290,9 +290,10 @@ func (kc *KinsController) installUnitCluster(nu *sitev1alpha2.NodeUnit) error {
 		}
 	}
 
-	if !hasTaint {
+	if !hasTaint || nu.Spec.UnitCredentialConfigMapRef == nil {
 		newNu := nu.DeepCopy()
 		newNu.Spec.SetNode.Taints = append(newNu.Spec.SetNode.Taints, corev1.Taint{Key: KinsResourceNameSuffix, Effect: corev1.TaintEffectNoSchedule})
+		newNu.Spec.UnitCredentialConfigMapRef = &corev1.ObjectReference{Namespace: DefaultKinsNamespace, Name: buildKinsConfigMapName(nu.Name), Kind: "ConfigMap"}
 		if _, err := kc.crdClient.SiteV1alpha2().NodeUnits().Update(context.TODO(), newNu, metav1.UpdateOptions{}); err != nil {
 			klog.ErrorS(err, "Update nodeUnit setnode taints: %s error: %#v", nu.Name)
 			return err
@@ -351,7 +352,6 @@ func (kc *KinsController) recoverNodeUnit(nu *sitev1alpha2.NodeUnit) error {
 	}
 
 	// recover node unit setnode
-	newNu := nu.DeepCopy()
 	var newTaints []corev1.Taint
 	for _, t := range nu.Spec.SetNode.Taints {
 		if t.Key != KinsResourceNameSuffix && t.Effect != corev1.TaintEffectNoSchedule {
@@ -359,8 +359,10 @@ func (kc *KinsController) recoverNodeUnit(nu *sitev1alpha2.NodeUnit) error {
 		}
 	}
 
-	newNu.Spec.SetNode.Taints = newTaints
-	if !reflect.DeepEqual(newTaints, nu.Spec.SetNode.Taints) {
+	if !reflect.DeepEqual(newTaints, nu.Spec.SetNode.Taints) || nu.Spec.UnitCredentialConfigMapRef != nil {
+		newNu := nu.DeepCopy()
+		newNu.Spec.SetNode.Taints = newTaints
+		newNu.Spec.UnitCredentialConfigMapRef = nil
 		if _, err := kc.crdClient.SiteV1alpha2().NodeUnits().Update(context.TODO(), newNu, metav1.UpdateOptions{}); err != nil {
 			klog.ErrorS(err, "Update nodeUnit setnode taints: %s error: %#v", nu.Name)
 			return err
