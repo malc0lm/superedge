@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"net"
 	"reflect"
 	"strings"
 	"time"
@@ -88,6 +90,23 @@ func (kc *KinsController) installUnitCluster(nu *sitev1alpha2.NodeUnit) error {
 		klog.V(4).InfoS("Finished install nodeunit cluster", "nodeunit", nu.Name, "duration", time.Since(startTime))
 	}()
 
+	// ensure kins-system namespace
+	if _, err := kc.kubeClient.CoreV1().Namespaces().Get(context.TODO(), DefaultKinsNamespace, metav1.GetOptions{}); err != nil {
+		if errors.IsNotFound(err) {
+			if _, err := kc.kubeClient.CoreV1().Namespaces().Create(
+				context.TODO(),
+				&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: DefaultKinsNamespace}},
+				metav1.CreateOptions{},
+			); err != nil {
+				klog.ErrorS(err, "create namespace error", "name", DefaultKinsNamespace)
+				return err
+			}
+		} else {
+			klog.ErrorS(err, "get namespace error", "name", DefaultKinsNamespace)
+			return err
+		}
+	}
+
 	// label server
 	// TOOD: find a property node as server
 	masterFound := false
@@ -130,7 +149,7 @@ func (kc *KinsController) installUnitCluster(nu *sitev1alpha2.NodeUnit) error {
 			}
 		}
 	}
-	uclusterServiceCIDR, uclusterDNSIP := caculateKinsServiceCIDRAndCoreDNSIP(existUnitCluster)
+	uclusterServiceCIDR, uclusterDNSIP := caculateKinsServiceCIDRAndCoreDNSIP(nu, existUnitCluster)
 
 	// create criw ds
 	criwOption := map[string]interface{}{
@@ -140,7 +159,7 @@ func (kc *KinsController) installUnitCluster(nu *sitev1alpha2.NodeUnit) error {
 		"UnitName":             nu.Name,
 		"NodeUnitSuperedge":    constant.NodeUnitSuperedge,
 		"KinsTaintKey":         KinsResourceNameSuffix,
-		"KinsCRIWImage":        KinsCRIWImage,
+		"KinsCRIWImage":        getCRIWImage(nu),
 	}
 	if err := kubectl.CreateResourceWithFile(kc.kubeClient, manifest.CRIWTemplate, criwOption); err != nil {
 		klog.ErrorS(err, "create criw daemonset error")
@@ -157,10 +176,10 @@ func (kc *KinsController) installUnitCluster(nu *sitev1alpha2.NodeUnit) error {
 		"KinsRoleLabelServer":  KinsRoleLabelServer,
 		"UnitName":             nu.Name,
 		"NodeUnitSuperedge":    constant.NodeUnitSuperedge,
-		"K3SServerImage":       K3SServerImage,
+		"K3SServerImage":       getK3SImage(nu),
 		"KinsSecretName":       buildKinsSecretName(nu.Name),
 		"ServiceCIDR":          uclusterServiceCIDR,
-		"KinsNodePortRange":    caculateKinsNodePortRange(int(existUnitCluster)),
+		"KinsNodePortRange":    caculateKinsNodePortRange(nu, int(existUnitCluster)),
 		"KinsCorednsIP":        uclusterDNSIP,
 	}
 	if err := kubectl.CreateResourceWithFile(kc.kubeClient, manifest.KinsServerTemplate, serverOption); err != nil {
@@ -223,7 +242,7 @@ func (kc *KinsController) installUnitCluster(nu *sitev1alpha2.NodeUnit) error {
 		"KinsRoleLabelServer":  KinsRoleLabelServer,
 		"UnitName":             nu.Name,
 		"NodeUnitSuperedge":    constant.NodeUnitSuperedge,
-		"K3SAgentImage":        K3SAgentImage,
+		"K3SAgentImage":        getK3SImage(nu),
 		"KinsSecretName":       buildKinsSecretName(nu.Name),
 		"KinsServerEndpoint":   buildKinsServerEndpoint(svc.Spec.ClusterIP, int(svc.Spec.Ports[0].Port)),
 	}
@@ -400,15 +419,36 @@ func buildKinsServerEndpoint(ip string, port int) string {
 	return fmt.Sprintf("%s://%s:%d", "https", ip, port)
 }
 
-func caculateKinsServiceCIDRAndCoreDNSIP(existUnitCluster int32) (string, string) {
-	return fmt.Sprintf(KinsServiceCIDR, existUnitCluster, "0/16"), fmt.Sprintf(KinsServiceCIDR, existUnitCluster, "255")
+func caculateKinsServiceCIDRAndCoreDNSIP(nu *sitev1alpha2.NodeUnit, existUnitCluster int32) (string, string) {
+	defaultSvcCidr, defaultCorednsIP := fmt.Sprintf(DefaultKinsServiceCIDR, existUnitCluster, "0/16"), fmt.Sprintf(DefaultKinsServiceCIDR, existUnitCluster, "255")
+
+	if nu.Spec.UnitClusterInfo != nil &&
+		nu.Spec.UnitClusterInfo.Parameters != nil &&
+		nu.Spec.UnitClusterInfo.Parameters[ParameterServiceCIDRKey] != "" {
+		// TODO validate service cidr
+		svcCidrStr := nu.Spec.UnitClusterInfo.Parameters[ParameterServiceCIDRKey]
+		_, svcCidr, err := net.ParseCIDR(svcCidrStr)
+		if err != nil {
+			klog.ErrorS(err, "invalid service cidr", "service cidr string", svcCidrStr)
+			return defaultSvcCidr, defaultCorednsIP
+		}
+		return svcCidrStr, getLastCIDRIPByIndex(svcCidr)
+	}
+
+	return defaultSvcCidr, defaultCorednsIP
 }
 
 // every unitcluster has 1000 nodeport,from 40000
-func caculateKinsNodePortRange(existUnitCluster int) string {
+func caculateKinsNodePortRange(nu *sitev1alpha2.NodeUnit, existUnitCluster int) string {
+	if nu.Spec.UnitClusterInfo != nil &&
+		nu.Spec.UnitClusterInfo.Parameters != nil &&
+		nu.Spec.UnitClusterInfo.Parameters[ParameterNodePortRangeKey] != "" {
+		// TODO validate node port range
+		return nu.Spec.UnitClusterInfo.Parameters[ParameterNodePortRangeKey]
+	}
 	var start, end int
 
-	start = KinsNodePortRangeStart + existUnitCluster*1000
+	start = DefaultKinsNodePortRangeStart + existUnitCluster*1000
 	end = start + 1000
 
 	return fmt.Sprintf("%d-%d", start, end)
@@ -423,4 +463,34 @@ func generateKinsSecretK3SToken(nuName string) string {
 
 func generateKinsSecretKnownToken() string {
 	return fmt.Sprintf("%s,admin,admin,system:masters", rand.String(32))
+}
+
+func getLastCIDRIPByIndex(ipnet *net.IPNet) string {
+	// convert IPNet struct mask and address to uint32
+	mask := binary.BigEndian.Uint32(ipnet.Mask)
+	start := binary.BigEndian.Uint32(ipnet.IP)
+
+	// find the final address
+	lastIP := (start & mask) | (mask ^ 0xffffffff)
+	ip := make(net.IP, 4)
+	binary.BigEndian.PutUint32(ip, lastIP)
+	return ip.String()
+}
+
+func getK3SImage(nu *sitev1alpha2.NodeUnit) string {
+	if nu.Spec.UnitClusterInfo != nil &&
+		nu.Spec.UnitClusterInfo.Parameters != nil &&
+		nu.Spec.UnitClusterInfo.Parameters[ParameterK3SImageKey] != "" {
+		return nu.Spec.UnitClusterInfo.Parameters[ParameterK3SImageKey]
+	}
+	return DefaultK3SImage
+}
+
+func getCRIWImage(nu *sitev1alpha2.NodeUnit) string {
+	if nu.Spec.UnitClusterInfo != nil &&
+		nu.Spec.UnitClusterInfo.Parameters != nil &&
+		nu.Spec.UnitClusterInfo.Parameters[ParameterCRIWImageKey] != "" {
+		return nu.Spec.UnitClusterInfo.Parameters[ParameterCRIWImageKey]
+	}
+	return DefaultKinsCRIWImage
 }

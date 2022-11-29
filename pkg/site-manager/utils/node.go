@@ -332,7 +332,7 @@ func DeleteNodesFromSetNode(kubeClient clientset.Interface, nu *sitev1.NodeUnit,
 		newNode := node.DeepCopy()
 		if nu.Spec.SetNode.Labels != nil {
 			if newNode.Labels != nil {
-				for k, _ := range nu.Spec.SetNode.Labels {
+				for k := range nu.Spec.SetNode.Labels {
 					delete(newNode.Labels, k)
 				}
 			}
@@ -340,7 +340,7 @@ func DeleteNodesFromSetNode(kubeClient clientset.Interface, nu *sitev1.NodeUnit,
 
 		if nu.Spec.SetNode.Annotations != nil {
 			if newNode.Annotations != nil {
-				for k, _ := range nu.Spec.SetNode.Annotations {
+				for k := range nu.Spec.SetNode.Annotations {
 					delete(newNode.Annotations, k)
 				}
 			}

@@ -271,20 +271,19 @@ type SetNode struct {
 	Taints []corev1.Taint `json:"taints,omitempty"`
 }
 
-type UnitClusterStorageSpec struct {
+// UnitClusterInfoSpec defines the information when unit cluster creating
+type UnitClusterInfoSpec struct {
 	// StorageType support sqlite(one master node) and built-in etcd(three master node)
 	// default is etcd
 	// +optional
 	StorageType string `json:"storageType,omitempty"`
-	// Parameters holds the parameters for the provisioner that should
-	// create volumes of this storage class.
-	// +optional
+	// Parameters holds the parameters for the unit cluster create information
 	Parameters map[string]string `json:"parameters,omitempty"`
 }
 
 // NodeUnitSpec defines the desired state of NodeUnit
 type NodeUnitSpec struct {
-	// Type of nodeunit， vaule: Cloud、Edge
+	// Type of nodeunit, vaule: cloud, edge, master, other
 	// +optional
 	//+kubebuilder:default=edge
 	Type NodeUnitType `json:"type"`
@@ -316,9 +315,9 @@ type NodeUnitSpec struct {
 	// +optional
 	UnitCredentialConfigMapRef *corev1.ObjectReference `json:"unitCredentialConfigMapRef,omitempty"`
 
-	// UnitClusterStorage holds configuration for unit cluster storage information.
+	// UnitClusterInfo holds configuration for unit cluster information.
 	// +optional
-	UnitClusterStorage *UnitClusterStorageSpec `json:"unitClusterStorage,omitempty"`
+	UnitClusterInfo *UnitClusterInfoSpec `json:"unitClusterInfo,omitempty"`
 }
 
 type UnitClusterStatus struct {

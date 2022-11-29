@@ -359,17 +359,17 @@ spec:
                 type: object
               type:
                 default: edge
-                description: 'Type of nodeunit， vaule: Cloud、Edge'
+                description: 'Type of nodeunit, vaule: cloud, edge, master, other'
                 type: string
-              unitClusterStorage:
-                description: UnitClusterStorage holds configuration for unit cluster
-                  storage information.
+              unitClusterInfo:
+                description: UnitClusterInfo holds configuration for unit cluster
+                  information.
                 properties:
                   parameters:
                     additionalProperties:
                       type: string
-                    description: Parameters holds the parameters for the provisioner
-                      that should create volumes of this storage class.
+                    description: Parameters holds the parameters for the unit cluster
+                      create information
                     type: object
                   storageType:
                     description: StorageType support sqlite(one master node) and built-in
