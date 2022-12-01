@@ -20,9 +20,11 @@ import (
 
 	"k8s.io/apimachinery/pkg/util/intstr"
 	applycorev1 "k8s.io/client-go/applyconfigurations/core/v1"
+	"k8s.io/client-go/kubernetes"
 	clientset "k8s.io/client-go/kubernetes"
 	applisters "k8s.io/client-go/listers/apps/v1"
 	corelisters "k8s.io/client-go/listers/core/v1"
+	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 
 	sitev1alpha2 "github.com/superedge/superedge/pkg/site-manager/apis/site.superedge.io/v1alpha2"
@@ -391,6 +393,28 @@ func (kc *KinsController) recoverNodeUnit(nu *sitev1alpha2.NodeUnit) error {
 	return nil
 }
 
+func (kc *KinsController) UpdateUnitClusterStatus(nu *sitev1alpha2.NodeUnit) (*sitev1alpha2.UnitClusterStatus, error) {
+	if nu.Spec.AutonomyLevel == sitev1alpha2.AutonomyLevelL3 {
+		return &nu.Status.UnitCluster, nil
+	}
+	newStatus := nu.Status.UnitCluster.DeepCopy()
+	kclient, err := BuildUnitClusterClientSet(kc.kubeClient, nu)
+	if err != nil {
+		return nil, err
+	}
+	// get version
+	version, err := kclient.Discovery().ServerVersion()
+	if err != nil {
+		newStatus.Phase = sitev1alpha2.ClusterFailed
+		klog.ErrorS(err, "get unit cluster version failed")
+	} else {
+		newStatus.Version = strings.TrimPrefix(version.String(), "v")
+		newStatus.Phase = sitev1alpha2.ClusterRunning
+	}
+
+	return newStatus, nil
+}
+
 func buildKinsCRIDaemonSetName(nuName string) string {
 	return fmt.Sprintf("%s-cri-%s", nuName, KinsResourceNameSuffix)
 }
@@ -493,4 +517,32 @@ func getCRIWImage(nu *sitev1alpha2.NodeUnit) string {
 		return nu.Spec.UnitClusterInfo.Parameters[ParameterCRIWImageKey]
 	}
 	return DefaultKinsCRIWImage
+}
+
+func BuildUnitClusterClientSet(k8sClientSet clientset.Interface, nu *sitev1alpha2.NodeUnit) (clientset.Interface, error) {
+	if nu.Spec.UnitCredentialConfigMapRef != nil {
+		cmName := nu.Spec.UnitCredentialConfigMapRef.Name
+		cmNamespace := nu.Spec.UnitCredentialConfigMapRef.Namespace
+
+		kubeconfigCM, err := k8sClientSet.CoreV1().ConfigMaps(cmNamespace).Get(context.TODO(), cmName, metav1.GetOptions{})
+		if err != nil {
+			return nil, err
+		}
+		kubeconfig, ok := kubeconfigCM.Data["kubeconfig.conf"]
+		if ok {
+			unitRestConfig, err := clientcmd.RESTConfigFromKubeConfig([]byte(kubeconfig))
+			if err != nil {
+				klog.ErrorS(err, "Failed to get restConfig", "nodeunit", nu.Name)
+				return nil, err
+			}
+			unitKubeClient, err := kubernetes.NewForConfig(unitRestConfig)
+			if err != nil {
+				klog.ErrorS(err, "Failed to build unit cluster kube client", "nodeunit", nu.Name)
+				return nil, err
+			}
+			return unitKubeClient, nil
+		}
+		klog.V(5).InfoS("Invalid UnitCredentialConfigMap for build clientset", "content", kubeconfigCM.String())
+	}
+	return nil, fmt.Errorf("Invalid node unit")
 }

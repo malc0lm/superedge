@@ -489,6 +489,12 @@ func (c *NodeUnitController) reconcileNodeUnit(nu *sitev1alpha2.NodeUnit) error 
 	if err != nil {
 		return nil
 	}
+	// 3.1 update node unit cluster status
+	ucStatus, err := c.kinsController.UpdateUnitClusterStatus(nu)
+	if err != nil {
+		klog.ErrorS(err, "Update node unit cluster status error", "node unit", nu.Name)
+	}
+	newStatus.UnitCluster = *ucStatus
 
 	if !reflect.DeepEqual(newStatus, &nu.Status) || !reflect.DeepEqual(newStatus, &nu.Status) {
 		nu.Status = *newStatus
