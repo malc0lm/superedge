@@ -142,6 +142,48 @@ func (kc *KinsController) installUnitCluster(nu *sitev1alpha2.NodeUnit) error {
 		}
 	}
 
+	// create criw ds
+	if err := kc.createCRIW(nu); err != nil {
+		return nil
+	}
+	// create kins server
+	svc, err := kc.createServer(nu)
+	if err != nil {
+		return err
+	}
+
+	// create kins agent
+	if err := kc.createAgent(nu, svc); err != nil {
+		return err
+	}
+
+	// create secret
+	if err := kc.creatSecret(nu, svc); err != nil {
+		return err
+	}
+
+	// set node taint
+	hasTaint := false
+	for _, t := range nu.Spec.SetNode.Taints {
+		if t.Key == KinsResourceNameSuffix && t.Effect == corev1.TaintEffectNoSchedule {
+			hasTaint = true
+		}
+	}
+
+	if !hasTaint || nu.Spec.UnitCredentialConfigMapRef == nil {
+		newNu := nu.DeepCopy()
+		newNu.Spec.SetNode.Taints = append(newNu.Spec.SetNode.Taints, corev1.Taint{Key: KinsResourceNameSuffix, Effect: corev1.TaintEffectNoSchedule})
+		newNu.Spec.UnitCredentialConfigMapRef = &corev1.ObjectReference{Namespace: DefaultKinsNamespace, Name: buildKinsConfigMapName(nu.Name), Kind: "ConfigMap"}
+		if _, err := kc.crdClient.SiteV1alpha2().NodeUnits().Update(context.TODO(), newNu, metav1.UpdateOptions{}); err != nil {
+			klog.ErrorS(err, "Update nodeUnit setnode taints: %s error: %#v", nu.Name)
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (kc *KinsController) createServer(nu *sitev1alpha2.NodeUnit) (*corev1.Service, error) {
 	var existUnitCluster int32
 	// caculate service cidr nodeport range and coredns IP
 	if nuList, err := kc.nodeUnitLister.List(labels.Everything()); err != nil {
@@ -151,24 +193,9 @@ func (kc *KinsController) installUnitCluster(nu *sitev1alpha2.NodeUnit) error {
 			}
 		}
 	}
+
 	uclusterServiceCIDR, uclusterDNSIP := caculateKinsServiceCIDRAndCoreDNSIP(nu, existUnitCluster)
 
-	// create criw ds
-	criwOption := map[string]interface{}{
-		"KinsResourceLabelKey": KinsResourceLabelKey,
-		"CRIWName":             buildKinsCRIDaemonSetName(nu.Name),
-		"KinsNamespace":        DefaultKinsNamespace,
-		"UnitName":             nu.Name,
-		"NodeUnitSuperedge":    constant.NodeUnitSuperedge,
-		"KinsTaintKey":         KinsResourceNameSuffix,
-		"KinsCRIWImage":        getCRIWImage(nu),
-	}
-	if err := kubectl.CreateResourceWithFile(kc.kubeClient, manifest.CRIWTemplate, criwOption); err != nil {
-		klog.ErrorS(err, "create criw daemonset error")
-		return err
-	}
-
-	// create kins server
 	serverOption := map[string]interface{}{
 		"KinsResourceLabelKey": KinsResourceLabelKey,
 		"KinsServerName":       buildKinsServerDaemonSetName(nu.Name),
@@ -186,7 +213,7 @@ func (kc *KinsController) installUnitCluster(nu *sitev1alpha2.NodeUnit) error {
 	}
 	if err := kubectl.CreateResourceWithFile(kc.kubeClient, manifest.KinsServerTemplate, serverOption); err != nil {
 		klog.ErrorS(err, "create kins server error")
-		return err
+		return nil, err
 	}
 	var svc *corev1.Service
 	var err error
@@ -226,33 +253,18 @@ func (kc *KinsController) installUnitCluster(nu *sitev1alpha2.NodeUnit) error {
 			)
 			if err != nil {
 				klog.ErrorS(err, "create kins service error")
-				return err
+				return nil, err
 			}
 		} else {
 			klog.ErrorS(err, "get kins service error")
-			return err
+			return nil, err
 		}
 	}
 
-	// create kins agent
-	agentOption := map[string]interface{}{
-		"KinsResourceLabelKey": KinsResourceLabelKey,
-		"KinsAgentName":        buildKinsAgentDaemonSetName(nu.Name),
-		"KinsNamespace":        DefaultKinsNamespace,
-		"KinsTaintKey":         KinsResourceNameSuffix,
-		"KinsRoleLabelKey":     KinsRoleLabelKey,
-		"KinsRoleLabelServer":  KinsRoleLabelServer,
-		"UnitName":             nu.Name,
-		"NodeUnitSuperedge":    constant.NodeUnitSuperedge,
-		"K3SAgentImage":        getK3SImage(nu),
-		"KinsSecretName":       buildKinsSecretName(nu.Name),
-		"KinsServerEndpoint":   buildKinsServerEndpoint(svc.Spec.ClusterIP, int(svc.Spec.Ports[0].Port)),
-	}
-	if err := kubectl.CreateResourceWithFile(kc.kubeClient, manifest.KinsAgentTemplate, agentOption); err != nil {
-		klog.ErrorS(err, "create kins agent error")
-		return err
-	}
+	return svc, nil
+}
 
+func (kc *KinsController) creatSecret(nu *sitev1alpha2.NodeUnit, serverSvc *corev1.Service) error {
 	knowToken := generateKinsSecretKnownToken()
 	knowTokenBase64 := base64.URLEncoding.EncodeToString([]byte(knowToken))
 	// get or create secret
@@ -290,7 +302,7 @@ func (kc *KinsController) installUnitCluster(nu *sitev1alpha2.NodeUnit) error {
 				"UnitName":             nu.Name,
 				"NodeUnitSuperedge":    constant.NodeUnitSuperedge,
 				"KinsNamespace":        DefaultKinsNamespace,
-				"K3SEndpoint":          buildKinsServerEndpoint(svc.Spec.ClusterIP, int(svc.Spec.Ports[0].Port)),
+				"K3SEndpoint":          buildKinsServerEndpoint(serverSvc.Spec.ClusterIP, int(serverSvc.Spec.Ports[0].Port)),
 				"KnowToken":            strings.Split(knowToken, ",")[0],
 			}
 			if err := kubectl.CreateResourceWithFile(kc.kubeClient, manifest.KinsConfigMapTemplate, configmapOption); err != nil {
@@ -303,22 +315,45 @@ func (kc *KinsController) installUnitCluster(nu *sitev1alpha2.NodeUnit) error {
 		}
 	}
 
-	// set node taint
-	hasTaint := false
-	for _, t := range nu.Spec.SetNode.Taints {
-		if t.Key == KinsResourceNameSuffix && t.Effect == corev1.TaintEffectNoSchedule {
-			hasTaint = true
-		}
+	return nil
+}
+
+func (kc *KinsController) createCRIW(nu *sitev1alpha2.NodeUnit) error {
+	criwOption := map[string]interface{}{
+		"KinsResourceLabelKey": KinsResourceLabelKey,
+		"CRIWName":             buildKinsCRIDaemonSetName(nu.Name),
+		"KinsNamespace":        DefaultKinsNamespace,
+		"UnitName":             nu.Name,
+		"NodeUnitSuperedge":    constant.NodeUnitSuperedge,
+		"KinsTaintKey":         KinsResourceNameSuffix,
+		"KinsCRIWImage":        getCRIWImage(nu),
+	}
+	if err := kubectl.CreateResourceWithFile(kc.kubeClient, manifest.CRIWTemplate, criwOption); err != nil {
+		klog.ErrorS(err, "create criw daemonset error")
+		return err
 	}
 
-	if !hasTaint || nu.Spec.UnitCredentialConfigMapRef == nil {
-		newNu := nu.DeepCopy()
-		newNu.Spec.SetNode.Taints = append(newNu.Spec.SetNode.Taints, corev1.Taint{Key: KinsResourceNameSuffix, Effect: corev1.TaintEffectNoSchedule})
-		newNu.Spec.UnitCredentialConfigMapRef = &corev1.ObjectReference{Namespace: DefaultKinsNamespace, Name: buildKinsConfigMapName(nu.Name), Kind: "ConfigMap"}
-		if _, err := kc.crdClient.SiteV1alpha2().NodeUnits().Update(context.TODO(), newNu, metav1.UpdateOptions{}); err != nil {
-			klog.ErrorS(err, "Update nodeUnit setnode taints: %s error: %#v", nu.Name)
-			return err
-		}
+	return nil
+}
+
+func (kc *KinsController) createAgent(nu *sitev1alpha2.NodeUnit, serverSvc *corev1.Service) error {
+	// create kins agent
+	agentOption := map[string]interface{}{
+		"KinsResourceLabelKey": KinsResourceLabelKey,
+		"KinsAgentName":        buildKinsAgentDaemonSetName(nu.Name),
+		"KinsNamespace":        DefaultKinsNamespace,
+		"KinsTaintKey":         KinsResourceNameSuffix,
+		"KinsRoleLabelKey":     KinsRoleLabelKey,
+		"KinsRoleLabelServer":  KinsRoleLabelServer,
+		"UnitName":             nu.Name,
+		"NodeUnitSuperedge":    constant.NodeUnitSuperedge,
+		"K3SAgentImage":        getK3SImage(nu),
+		"KinsSecretName":       buildKinsSecretName(nu.Name),
+		"KinsServerEndpoint":   buildKinsServerEndpoint(serverSvc.Spec.ClusterIP, int(serverSvc.Spec.Ports[0].Port)),
+	}
+	if err := kubectl.CreateResourceWithFile(kc.kubeClient, manifest.KinsAgentTemplate, agentOption); err != nil {
+		klog.ErrorS(err, "create kins agent error")
+		return err
 	}
 
 	return nil

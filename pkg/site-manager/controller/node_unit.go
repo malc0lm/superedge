@@ -418,6 +418,9 @@ func (c *NodeUnitController) reconcileNodeUnit(nu *sitev1alpha2.NodeUnit) error 
 
 	// 0. list nodemap and nodeset belong to current node unit
 	unitNodeSet, nodeMap, err := utils.GetNodesByUnit(c.nodeLister, nu)
+	if err != nil {
+		return err
+	}
 	// 1. check nodes which should not belong to this unit, clear them(this will use gc)
 
 	currentNodeSet := sets.NewString()
