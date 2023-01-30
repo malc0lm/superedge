@@ -13,7 +13,7 @@ spec:
   selector:
     matchLabels:
       site.superedge.io/kins-role: agent
-  template: # create pods using pod definition in this template
+  template:
     metadata:
       labels:
         site.superedge.io/kins-role: agent
@@ -64,13 +64,18 @@ spec:
               name: {{ .KinsSecretName }}
               key: jointoken
               optional: false
+        - name: K3S_NODE_NAME
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: spec.nodeName
         args: 
         - agent
         - --container-runtime-endpoint=/run/kins.sock
-        - --server={{ .KinsServerEndpoint }}
+        - --server=https://{{ .KinsServerEndpoint }}
         - --token=$(K3S_JOIN_TOKEN)
         - --kubelet-arg=--cgroup-root=/edgek3s
-        - --kubelet-arg=--root-dir=/data/edge/k3s
+        - --kubelet-arg=--root-dir=/data/edge/rancher-kubelet
         ports:
         - containerPort: 10250
         volumeMounts:
@@ -92,10 +97,12 @@ spec:
         - name: host-kubelet-log
           mountPath: /data/edge/log/pods
         - name: k3sroot
-          mountPath: /data/edge/k3s
+          mountPath: /data/edge/rancher-kubelet
           mountPropagation: "Bidirectional"
         - name: rancher-root
           mountPath: /var/lib/rancher
+        - name: rancher-etc
+          mountPath: /etc/rancher
       volumes:
         - hostPath:
             path: /run
@@ -120,9 +127,11 @@ spec:
             path: /data/edge/log/pods
         - name: k3sroot
           hostPath:
-            path: /data/edge/k3s
+            path: /data/edge/rancher-kubelet
             type: DirectoryOrCreate
         - hostPath:
-            path: /var/lib/rancher
+            path: /data/edge/rancher-root
           name: rancher-root
-`
+        - hostPath:
+            path: /data/edge/rancher-etc
+          name: rancher-etc`

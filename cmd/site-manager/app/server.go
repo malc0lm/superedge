@@ -89,15 +89,15 @@ func NewSiteManagerDaemonCommand() *cobra.Command {
 					}, wait.NeverStop)
 				}
 				// default create unit and verison migration
-				wait.PollImmediate(time.Second*5, 5*time.Minute, func() (bool, error) {
-					if err := utils.InitAllRosource(ctx, crdClient); err != nil {
+				wait.PollImmediateUntil(time.Second*5, func() (bool, error) {
+					if err := utils.InitAllRosource(ctx, crdClient, extensionsClient); err != nil {
 						klog.Errorf("InitAllRosource error: %#v", err)
 						return false, nil
 					}
 					return true, nil
-				})
+				}, wait.NeverStop)
 			}
-			go runConfig(context.TODO())
+			runConfig(context.TODO())
 
 			// not leade elect
 			if !siteOptions.LeaderElect {

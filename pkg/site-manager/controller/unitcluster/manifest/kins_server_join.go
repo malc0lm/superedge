@@ -1,44 +1,27 @@
 package manifest
 
-const KinsServerTemplate = `
-apiVersion: v1
-kind: Service
-metadata:
-  name: {{ .KinsServerName }}-init
-  namespace: {{ .KinsNamespace }}
-  labels:
-    {{ .KinsResourceLabelKey }}: "yes"
-    {{ .UnitName }}: {{ .NodeUnitSuperedge }}
-spec:
-  ports:
-  - port: 6443
-    name: https
-  clusterIP: None
-  selector:
-    site.superedge.io/kins-role: server
-    site.superedge.io/server-type: init
----
+const KinsServerJoinTemplate = `
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   labels:
     {{ .KinsResourceLabelKey }}: "yes"
     {{ .UnitName }}: {{ .NodeUnitSuperedge }}
-  name: {{ .KinsServerName }}
+  name: {{ .KinsServerName }}-join
   namespace: {{ .KinsNamespace }}
 spec:
-  replicas: 1
-  serviceName: {{ .KinsServerName }}-init
+  replicas: 2
+  serviceName: {{ .KinsServerName }}-join
   selector:
     matchLabels:
       site.superedge.io/kins-role: server
-      site.superedge.io/server-type: init
+      site.superedge.io/server-type: join      
   template:
     metadata:
       labels:
         site.superedge.io/kins-role: server
-        site.superedge.io/server-type: init
-      name: k3s-server
+        site.superedge.io/server-type: join        
+      name: k3s-server-join
     spec:
       tolerations:
       - key: "{{ .KinsTaintKey }}"
@@ -65,19 +48,12 @@ spec:
                 operator: In
                 values:
                 - {{ .KinsRoleLabelServer }}
-                - {{ .KinsRoleLabelAgent }}
+                - {{ .KinsRoleLabelAgent }}               
             topologyKey: kubernetes.io/hostname
       initContainers:
       - name: mkcgroup
         image: {{ .K3SServerImage }}
         imagePullPolicy: IfNotPresent
-        env:
-        - name: K3S_TOKEN
-          valueFrom:
-            secretKeyRef:
-              name: {{ .KinsSecretName }}
-              key: k3stoken
-              optional: false
         command:
           - /bin/sh
           - -cx
@@ -87,9 +63,11 @@ spec:
             do
               mkdir -p /sys/fs/cgroup/$d/edgek3s
             done
-            SNAPFILE=$(ls -t1  /var/lib/rancher/k3s/server/db/snapshots/etcd-snapshot-* | head -n1)
-            if [ $? -eq 0 ]; then
-              /k3s server --cluster-reset --cluster-reset-restore-path=$SNAPFILE
+            if [ -d "/var/lib/rancher/k3s/server/db-old" ]; then
+              rm -fr /var/lib/rancher/k3s/server/db-old
+            fi
+            if [ -d "/var/lib/rancher/k3s/server/db" ]; then
+              mv /var/lib/rancher/k3s/server/db /var/lib/rancher/k3s/server/db-old
             fi
         volumeMounts:
           - name: host-sys
@@ -127,7 +105,7 @@ spec:
         - --kube-apiserver-arg=--token-auth-file=/etc/edge/known_tokens.csv
         - --kubelet-arg=--cgroup-root=/edgek3s
         - --kubelet-arg=--root-dir=/data/edge/rancher-kubelet
-        - --cluster-init
+        - --server=https://{{ .KinsServerName }}-0.{{ .KinsServerName }}-init.{{ .KinsNamespace }}.svc:6443
         ports:
         - containerPort: 6443
         volumeMounts:

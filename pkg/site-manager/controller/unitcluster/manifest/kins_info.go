@@ -32,7 +32,7 @@ data:
     clusters:
     - cluster:
         insecure-skip-tls-verify: true
-        server: {{ .K3SEndpoint }}
+        server: {{ .KinsServerEndpoint }}
       name: default
     contexts:
     - context:

@@ -484,9 +484,7 @@ func (c *NodeUnitController) reconcileNodeUnit(nu *sitev1alpha2.NodeUnit) error 
 	}
 
 	// 2.3 check node unit autonomy level if need install/uninstall unit cluster
-	if err := c.kinsController.ReconcileUnitCluster(nu); err != nil {
-		return err
-	}
+	ucerr := c.kinsController.ReconcileUnitCluster(nu)
 	// 3. caculate node unit status
 	newStatus, err := utils.CaculateNodeUnitStatus(nodeMap, nu)
 	if err != nil {
@@ -496,6 +494,19 @@ func (c *NodeUnitController) reconcileNodeUnit(nu *sitev1alpha2.NodeUnit) error 
 	ucStatus, err := c.kinsController.UpdateUnitClusterStatus(nu)
 	if err != nil {
 		klog.ErrorS(err, "Update node unit cluster status error", "node unit", nu.Name)
+		return err
+	}
+	if ucerr != nil {
+		klog.ErrorS(ucerr, "ReconcileUnitCluster error", "node unit", nu.Name)
+		ucStatus.Phase = sitev1alpha2.ClusterFailed
+		ucStatus.Conditions = []sitev1alpha2.ClusterCondition{
+			{
+				Type:          "Init",
+				Status:        sitev1alpha2.ConditionFalse,
+				LastProbeTime: metav1.Now(),
+				Message:       ucerr.Error(),
+			},
+		}
 	}
 	newStatus.UnitCluster = *ucStatus
 

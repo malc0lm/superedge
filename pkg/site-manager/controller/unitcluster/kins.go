@@ -18,7 +18,6 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/rand"
 
-	"k8s.io/apimachinery/pkg/util/intstr"
 	applycorev1 "k8s.io/client-go/applyconfigurations/core/v1"
 	"k8s.io/client-go/kubernetes"
 	clientset "k8s.io/client-go/kubernetes"
@@ -68,15 +67,11 @@ func (kc *KinsController) ReconcileUnitCluster(nu *sitev1alpha2.NodeUnit) error 
 	case sitev1alpha2.AutonomyLevelL3:
 		// L3 should uninstall unitcluster
 		return kc.recoverNodeUnit(nu)
-	case sitev1alpha2.AutonomyLevelL4:
+	case sitev1alpha2.AutonomyLevelL4, sitev1alpha2.AutonomyLevelL5:
 		// need install single master unitcluster and the storage backend is sqlite
 		// nodeunit setnode taints
 		return kc.installUnitCluster(nu)
 	// update nodeunit
-
-	case sitev1alpha2.AutonomyLevelL5:
-		klog.Warningf("Unsupport L5 currently!")
-		return nil
 
 	default:
 		klog.Warningf("Unsupport AutonomyLevel!")
@@ -111,54 +106,31 @@ func (kc *KinsController) installUnitCluster(nu *sitev1alpha2.NodeUnit) error {
 
 	// label server
 	// TOOD: find a property node as server
-	masterFound := false
-	_, nodeMap, getNodeErr := utils.GetNodesByUnit(kc.nodeLister, nu)
-	if getNodeErr != nil {
-		return getNodeErr
+	serverNodes, err := kc.labelServerNode(nu)
+	if err != nil {
+		return err
 	}
-	for _, node := range nodeMap {
-		if node.Labels[KinsRoleLabelKey] == KinsRoleLabelServer {
-			masterFound = true
-		}
+	// ensure create master node local pv
+	if err := kc.createServerStorage(nu, serverNodes); err != nil {
+		return err
 	}
-	// if node unit has not master node label
-	if !masterFound {
-		var masterNodeName string
-		if len(nu.Status.ReadyNodes) > 0 {
-			masterNodeName = nu.Status.ReadyNodes[0]
-		} else {
-			klog.Errorf("Node unit=%s has not ready node", nu.Name)
-			return fmt.Errorf("No Ready Node")
-		}
-
-		nac := applycorev1.Node(masterNodeName).WithLabels(
-			map[string]string{
-				KinsRoleLabelKey: KinsRoleLabelServer,
-			},
-		)
-		if _, err := kc.kubeClient.CoreV1().Nodes().Apply(context.TODO(), nac, metav1.ApplyOptions{FieldManager: "application/apply-patch"}); err != nil {
-			klog.ErrorS(err, "Update node server label error,node unit %s", nu.Name)
-			return err
-		}
-	}
-
 	// create criw ds
 	if err := kc.createCRIW(nu); err != nil {
-		return nil
+		return err
 	}
 	// create kins server
-	svc, err := kc.createServer(nu)
-	if err != nil {
+
+	if err := kc.createServer(nu); err != nil {
 		return err
 	}
 
 	// create kins agent
-	if err := kc.createAgent(nu, svc); err != nil {
+	if err := kc.createAgent(nu); err != nil {
 		return err
 	}
 
 	// create secret
-	if err := kc.creatSecret(nu, svc); err != nil {
+	if err := kc.creatSecret(nu); err != nil {
 		return err
 	}
 
@@ -183,7 +155,101 @@ func (kc *KinsController) installUnitCluster(nu *sitev1alpha2.NodeUnit) error {
 	return nil
 }
 
-func (kc *KinsController) createServer(nu *sitev1alpha2.NodeUnit) (*corev1.Service, error) {
+func (kc *KinsController) labelServerNode(nu *sitev1alpha2.NodeUnit) ([]string, error) {
+	var serverNodes []string
+	_, nodeMap, err := utils.GetNodesByUnit(kc.nodeLister, nu)
+	if err != nil {
+		return nil, err
+	}
+	for _, node := range nodeMap {
+		if node.Labels[KinsRoleLabelKey] == KinsRoleLabelServer {
+			serverNodes = append(serverNodes, node.Name)
+		}
+	}
+	// L4 level need at least one server node
+	if nu.Spec.AutonomyLevel == sitev1alpha2.AutonomyLevelL4 && len(serverNodes) < 1 {
+		if len(nu.Status.ReadyNodes) > 0 {
+			serverNodes = append(serverNodes, nu.Status.ReadyNodes[0])
+		} else {
+			klog.Errorf("Node unit=%s ready node insufficient", nu.Name)
+			return nil, fmt.Errorf("Insufficient Ready Node")
+		}
+
+		nac := applycorev1.Node(nu.Status.ReadyNodes[0]).WithLabels(
+			map[string]string{
+				KinsRoleLabelKey: KinsRoleLabelServer,
+			},
+		)
+		if _, err := kc.kubeClient.CoreV1().Nodes().Apply(context.TODO(), nac, metav1.ApplyOptions{FieldManager: "application/apply-patch"}); err != nil {
+			klog.ErrorS(err, "Update node server label error,node unit %s", nu.Name)
+			return nil, err
+		}
+
+		return serverNodes, nil
+	}
+	if nu.Spec.AutonomyLevel == sitev1alpha2.AutonomyLevelL5 && len(serverNodes) < 3 {
+		if len(nu.Status.ReadyNodes) > 2 {
+			serverNodes = append(serverNodes, nu.Status.ReadyNodes[0:3]...)
+		} else {
+			klog.Errorf("Node unit=%s ready node insufficient", nu.Name)
+			return nil, fmt.Errorf("Insufficient Ready Node")
+		}
+
+		for _, nodeName := range nu.Status.ReadyNodes[0:3] {
+			nac := applycorev1.Node(nodeName).WithLabels(
+				map[string]string{
+					KinsRoleLabelKey: KinsRoleLabelServer,
+				},
+			)
+			if _, err := kc.kubeClient.CoreV1().Nodes().Apply(context.TODO(), nac, metav1.ApplyOptions{FieldManager: "application/apply-patch"}); err != nil {
+				klog.ErrorS(err, "Update node server label error,node unit %s", nu.Name)
+				return nil, err
+			}
+		}
+		return serverNodes, nil
+	}
+	return serverNodes, nil
+}
+
+func (kc *KinsController) createServerStorage(nu *sitev1alpha2.NodeUnit, serverNodes []string) error {
+	// TODO: retkink error when pv create or update error
+	scOption := map[string]interface{}{
+		"KinsResourceLabelKey": KinsResourceLabelKey,
+		"UnitName":             nu.Name,
+		"NodeUnitSuperedge":    constant.NodeUnitSuperedge,
+	}
+
+	if err := kubectl.CreateResourceWithFile(kc.kubeClient, manifest.KinsStorageClassTemplate, scOption); err != nil {
+		klog.ErrorS(err, "create kins server sc error")
+		return err
+	}
+	type node struct {
+		Name                 string
+		KinsResourceLabelKey string
+		UnitName             string
+		NodeUnitSuperedge    string
+	}
+	nodes := make([]node, len(serverNodes))
+	for i, n := range serverNodes {
+		nodes[i] = node{
+			Name:                 n,
+			KinsResourceLabelKey: KinsResourceLabelKey,
+			UnitName:             nu.Name,
+			NodeUnitSuperedge:    constant.NodeUnitSuperedge,
+		}
+	}
+	pvOption := map[string]interface{}{
+		"Nodes": nodes,
+	}
+	if err := kubectl.CreateResourceWithFile(kc.kubeClient, manifest.KinsPVTemplate, pvOption); err != nil {
+		klog.ErrorS(err, "create kins server sc error")
+		// when pv exist, create or update pv will get a http 422 error
+		return err
+	}
+	return nil
+}
+
+func (kc *KinsController) createServer(nu *sitev1alpha2.NodeUnit) error {
 	var existUnitCluster int32
 	// caculate service cidr nodeport range and coredns IP
 	if nuList, err := kc.nodeUnitLister.List(labels.Everything()); err != nil {
@@ -198,11 +264,12 @@ func (kc *KinsController) createServer(nu *sitev1alpha2.NodeUnit) (*corev1.Servi
 
 	serverOption := map[string]interface{}{
 		"KinsResourceLabelKey": KinsResourceLabelKey,
-		"KinsServerName":       buildKinsServerDaemonSetName(nu.Name),
+		"KinsServerName":       buildKinsServerStatefulSetName(nu.Name),
 		"KinsNamespace":        DefaultKinsNamespace,
 		"KinsTaintKey":         KinsResourceNameSuffix,
 		"KinsRoleLabelKey":     KinsRoleLabelKey,
 		"KinsRoleLabelServer":  KinsRoleLabelServer,
+		"KinsRoleLabelAgent":   KinsRoleLabelAgent,
 		"UnitName":             nu.Name,
 		"NodeUnitSuperedge":    constant.NodeUnitSuperedge,
 		"K3SServerImage":       getK3SImage(nu),
@@ -213,58 +280,35 @@ func (kc *KinsController) createServer(nu *sitev1alpha2.NodeUnit) (*corev1.Servi
 	}
 	if err := kubectl.CreateResourceWithFile(kc.kubeClient, manifest.KinsServerTemplate, serverOption); err != nil {
 		klog.ErrorS(err, "create kins server error")
-		return nil, err
+		return err
 	}
-	var svc *corev1.Service
-	var err error
-	if svc, err = kc.kubeClient.CoreV1().Services(DefaultKinsNamespace).Get(context.TODO(), buildKinsServiceName(nu.Name), metav1.GetOptions{}); err != nil {
-		if errors.IsNotFound(err) {
-			// create kins server service
-			svc, err = kc.kubeClient.CoreV1().Services(DefaultKinsNamespace).Create(
-				context.TODO(),
-				&corev1.Service{
-					ObjectMeta: metav1.ObjectMeta{
-						Name: buildKinsServiceName(nu.Name),
-						Labels: map[string]string{
-							KinsResourceLabelKey: "yes",
-							nu.Name:              constant.NodeUnitSuperedge,
-						},
-						Namespace: DefaultKinsNamespace,
-					},
-					Spec: corev1.ServiceSpec{
-						Type: corev1.ServiceTypeClusterIP,
-						Selector: map[string]string{
-							KinsRoleLabelKey: KinsRoleLabelServer,
-						},
-						Ports: []corev1.ServicePort{
-							{
-								Name:     "https",
-								Protocol: corev1.ProtocolTCP,
-								Port:     443,
-								TargetPort: intstr.IntOrString{
-									Type:   intstr.Int,
-									IntVal: 6443,
-								},
-							},
-						},
-					},
-				},
-				metav1.CreateOptions{},
-			)
-			if err != nil {
-				klog.ErrorS(err, "create kins service error")
-				return nil, err
-			}
-		} else {
-			klog.ErrorS(err, "get kins service error")
-			return nil, err
+
+	if nu.Spec.AutonomyLevel == sitev1alpha2.AutonomyLevelL5 {
+		// L5 need create 3 node etcd and server
+		if err := kubectl.CreateResourceWithFile(kc.kubeClient, manifest.KinsServerJoinTemplate, serverOption); err != nil {
+			klog.ErrorS(err, "create kins server join error")
+			return err
 		}
 	}
 
-	return svc, nil
+	serviceOption := map[string]interface{}{
+		"KinsResourceLabelKey":  KinsResourceLabelKey,
+		"KinsServerServiceName": buildKinsServiceName(nu.Name),
+		"KinsNamespace":         DefaultKinsNamespace,
+		"KinsRoleLabelKey":      KinsRoleLabelKey,
+		"KinsRoleLabelServer":   KinsRoleLabelServer,
+		"UnitName":              nu.Name,
+		"NodeUnitSuperedge":     constant.NodeUnitSuperedge,
+	}
+	if err := kubectl.CreateResourceWithFile(kc.kubeClient, manifest.KinsServiceTemplate, serviceOption); err != nil {
+		klog.ErrorS(err, "create kins server service error")
+		return err
+	}
+
+	return nil
 }
 
-func (kc *KinsController) creatSecret(nu *sitev1alpha2.NodeUnit, serverSvc *corev1.Service) error {
+func (kc *KinsController) creatSecret(nu *sitev1alpha2.NodeUnit) error {
 	knowToken := generateKinsSecretKnownToken()
 	knowTokenBase64 := base64.URLEncoding.EncodeToString([]byte(knowToken))
 	// get or create secret
@@ -302,7 +346,7 @@ func (kc *KinsController) creatSecret(nu *sitev1alpha2.NodeUnit, serverSvc *core
 				"UnitName":             nu.Name,
 				"NodeUnitSuperedge":    constant.NodeUnitSuperedge,
 				"KinsNamespace":        DefaultKinsNamespace,
-				"K3SEndpoint":          buildKinsServerEndpoint(serverSvc.Spec.ClusterIP, int(serverSvc.Spec.Ports[0].Port)),
+				"KinsServerEndpoint":   buildKinsServiceName(nu.Name),
 				"KnowToken":            strings.Split(knowToken, ",")[0],
 			}
 			if err := kubectl.CreateResourceWithFile(kc.kubeClient, manifest.KinsConfigMapTemplate, configmapOption); err != nil {
@@ -336,11 +380,11 @@ func (kc *KinsController) createCRIW(nu *sitev1alpha2.NodeUnit) error {
 	return nil
 }
 
-func (kc *KinsController) createAgent(nu *sitev1alpha2.NodeUnit, serverSvc *corev1.Service) error {
+func (kc *KinsController) createAgent(nu *sitev1alpha2.NodeUnit) error {
 	// create kins agent
 	agentOption := map[string]interface{}{
 		"KinsResourceLabelKey": KinsResourceLabelKey,
-		"KinsAgentName":        buildKinsAgentDaemonSetName(nu.Name),
+		"KinsAgentName":        buildKinsAgentStatefulSetName(nu.Name),
 		"KinsNamespace":        DefaultKinsNamespace,
 		"KinsTaintKey":         KinsResourceNameSuffix,
 		"KinsRoleLabelKey":     KinsRoleLabelKey,
@@ -349,7 +393,7 @@ func (kc *KinsController) createAgent(nu *sitev1alpha2.NodeUnit, serverSvc *core
 		"NodeUnitSuperedge":    constant.NodeUnitSuperedge,
 		"K3SAgentImage":        getK3SImage(nu),
 		"KinsSecretName":       buildKinsSecretName(nu.Name),
-		"KinsServerEndpoint":   buildKinsServerEndpoint(serverSvc.Spec.ClusterIP, int(serverSvc.Spec.Ports[0].Port)),
+		"KinsServerEndpoint":   buildKinsServiceName(nu.Name),
 	}
 	if err := kubectl.CreateResourceWithFile(kc.kubeClient, manifest.KinsAgentTemplate, agentOption); err != nil {
 		klog.ErrorS(err, "create kins agent error")
@@ -376,6 +420,16 @@ func (kc *KinsController) recoverNodeUnit(nu *sitev1alpha2.NodeUnit) error {
 		klog.V(4).ErrorS(err, "Delete kins daemonset error", "node unit", nu.Name)
 		return err
 	}
+	// delete sts
+	if err := kc.kubeClient.AppsV1().StatefulSets(DefaultKinsNamespace).DeleteCollection(
+		context.TODO(),
+		metav1.DeleteOptions{},
+		metav1.ListOptions{LabelSelector: unitResourceLabel.String()},
+	); err != nil && !errors.IsNotFound(err) {
+		klog.V(4).ErrorS(err, "Delete kins statefulset error", "node unit", nu.Name)
+		return err
+	}
+
 	// delete service
 	if err := kc.kubeClient.CoreV1().Services(DefaultKinsNamespace).Delete(
 		context.TODO(),
@@ -385,6 +439,15 @@ func (kc *KinsController) recoverNodeUnit(nu *sitev1alpha2.NodeUnit) error {
 		klog.V(4).ErrorS(err, "Delete kins service error", "node unit", nu.Name)
 		return err
 	}
+	if err := kc.kubeClient.CoreV1().Services(DefaultKinsNamespace).Delete(
+		context.TODO(),
+		buildKinsServerStatefulSetName(nu.Name)+"-init",
+		metav1.DeleteOptions{},
+	); err != nil && !errors.IsNotFound(err) {
+		klog.V(4).ErrorS(err, "Delete kins service init error", "node unit", nu.Name)
+		return err
+	}
+
 	// delete secret
 	// do not delete secret default, or k3s server will error in restart
 	if nu.Annotations[KinsUnitClusterClearAnno] == "yes" {
@@ -433,19 +496,19 @@ func (kc *KinsController) UpdateUnitClusterStatus(nu *sitev1alpha2.NodeUnit) (*s
 		return &nu.Status.UnitCluster, nil
 	}
 	newStatus := nu.Status.UnitCluster.DeepCopy()
-	kclient, err := BuildUnitClusterClientSet(kc.kubeClient, nu)
-	if err != nil {
-		return nil, err
-	}
+	// kclient, err := BuildUnitClusterClientSet(kc.kubeClient, nu)
+	// if err != nil {
+	// 	return nil, err
+	// }
 	// get version
-	version, err := kclient.Discovery().ServerVersion()
-	if err != nil {
-		newStatus.Phase = sitev1alpha2.ClusterFailed
-		klog.ErrorS(err, "get unit cluster version failed")
-	} else {
-		newStatus.Version = strings.TrimPrefix(version.String(), "v")
-		newStatus.Phase = sitev1alpha2.ClusterRunning
-	}
+	// version, err := kclient.Discovery().ServerVersion()
+	// if err != nil {
+	// 	newStatus.Phase = sitev1alpha2.ClusterFailed
+	// 	klog.ErrorS(err, "get unit cluster version failed")
+	// } else {
+	// 	newStatus.Version = strings.TrimPrefix(version.String(), "v")
+	// 	newStatus.Phase = sitev1alpha2.ClusterRunning
+	// }
 
 	return newStatus, nil
 }
@@ -454,24 +517,24 @@ func buildKinsCRIDaemonSetName(nuName string) string {
 	return fmt.Sprintf("%s-cri-%s", nuName, KinsResourceNameSuffix)
 }
 
-func buildKinsServerDaemonSetName(nuName string) string {
+func buildKinsServerStatefulSetName(nuName string) string {
 	return fmt.Sprintf("%s-server-%s", nuName, KinsResourceNameSuffix)
 }
 
-func buildKinsAgentDaemonSetName(nuName string) string {
+func buildKinsAgentStatefulSetName(nuName string) string {
 	return fmt.Sprintf("%s-agent-%s", nuName, KinsResourceNameSuffix)
 }
 
 func buildKinsServiceName(nuName string) string {
-	return fmt.Sprintf("%s-%s", nuName, KinsResourceNameSuffix)
+	return fmt.Sprintf("%s-svc-%s", nuName, KinsResourceNameSuffix)
 }
 
 func buildKinsConfigMapName(nuName string) string {
-	return fmt.Sprintf("%s-%s", nuName, KinsResourceNameSuffix)
+	return fmt.Sprintf("%s-cm-%s", nuName, KinsResourceNameSuffix)
 }
 
 func buildKinsSecretName(nuName string) string {
-	return fmt.Sprintf("%s-%s", nuName, KinsResourceNameSuffix)
+	return fmt.Sprintf("%s-sec-%s", nuName, KinsResourceNameSuffix)
 }
 
 func buildKinsServerEndpoint(ip string, port int) string {
